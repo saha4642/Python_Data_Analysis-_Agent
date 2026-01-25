@@ -248,8 +248,8 @@ def generate_analysis_ideas(df: pd.DataFrame, max_ideas: int = 12) -> List[str]:
 # ============================================================
 # Streamlit UI (unchanged)
 # ============================================================
-st.set_page_config(page_title="Chat with CSV (OpenAI)", layout="wide")
-st.title("📊 Chat with Your Data (OpenAI)")
+st.set_page_config(page_title="Chat with CSV", layout="wide")
+st.title("📊 Chat with Your Data")
 st.caption("Upload a CSV → ask questions → see answers and plots")
 
 if "df" not in st.session_state:
