@@ -5,7 +5,7 @@ A user-friendly Next.js application for exploratory data analysis in the browser
 - Dataset size, completeness, and duplicate checks
 - Column type detection and data quality summaries
 - Numeric distribution statistics
-- Important visualization dashboard with completeness gauges, type mix, missingness hotspots, histograms, box plots, and correlation heatmaps
+- Best-fit storytelling dashboard that prioritizes the most suitable visuals for the uploaded data, including completeness gauges, type mix, missingness hotspots, timeline bars, category rankings, histograms, box plots, and relationship cards
 - Top categorical values
 - Correlation signals between numeric fields
 - Practical next-step insights for cleaning and modeling
