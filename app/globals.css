@@ -701,7 +701,7 @@ dd {
 
 .histogram-bars {
   display: flex;
-  align-items: end;
+  align-items: flex-end;
   height: 140px;
   gap: 6px;
   padding: 10px;
@@ -793,5 +793,198 @@ dd {
   .missing-row strong,
   .heatmap-cell span:last-child {
     text-align: left;
+  }
+}
+
+.story-board {
+  display: grid;
+  gap: 20px;
+}
+
+.story-lead {
+  padding: 22px;
+  border: 1px solid #c7d7fe;
+  border-radius: 24px;
+  background: linear-gradient(135deg, #ffffff, #eef4ff);
+}
+
+.story-lead h3 {
+  margin-bottom: 8px;
+  font-size: clamp(1.4rem, 2.4vw, 2rem);
+  letter-spacing: -0.04em;
+}
+
+.story-lead p:last-child {
+  max-width: 780px;
+  margin-bottom: 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.story-grid {
+  align-items: stretch;
+}
+
+.story-card {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.story-card-relationship,
+.story-card-missingness,
+.story-card-distribution {
+  grid-column: 1 / -1;
+}
+
+.story-card > .viz-card {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.story-card > .donut-card {
+  grid-template-columns: 130px 1fr;
+}
+
+.story-card > .donut-card .donut {
+  width: 130px;
+  height: 130px;
+}
+
+.story-card > .donut-card .donut::before {
+  width: 92px;
+  height: 92px;
+}
+
+.story-card > .donut-card .donut strong {
+  font-size: 1.7rem;
+}
+
+.story-card > .wide-viz-card {
+  grid-column: auto;
+}
+
+.story-why {
+  margin-top: auto;
+  padding: 15px;
+  border-radius: 18px;
+  background: #f9fafb;
+}
+
+.story-why span {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--primary-dark);
+  font-size: 0.78rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.story-why p {
+  margin-bottom: 0;
+  color: #475467;
+  line-height: 1.55;
+}
+
+.story-chart-card {
+  background: #ffffff;
+}
+
+.story-category-chart {
+  display: grid;
+  gap: 14px;
+}
+
+.timeline-chart {
+  display: grid;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+  gap: 10px;
+  min-height: 210px;
+  padding: 16px;
+  border-radius: 18px;
+  background: linear-gradient(180deg, #ffffff, #eef4ff);
+}
+
+.timeline-bucket {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  gap: 8px;
+  align-items: flex-end;
+  min-width: 0;
+}
+
+.timeline-bucket span {
+  display: block;
+  width: 100%;
+  min-height: 4px;
+  border-radius: 10px 10px 3px 3px;
+  background: linear-gradient(180deg, var(--accent), var(--primary));
+}
+
+.timeline-bucket small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.relationship-story-chart {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 18px;
+  align-items: center;
+  padding: 18px;
+  border-radius: 20px;
+  background: #f9fafb;
+}
+
+.relationship-score {
+  display: grid;
+  width: 104px;
+  height: 104px;
+  place-items: center;
+  color: #ffffff;
+  font-size: 1.9rem;
+  font-weight: 900;
+  border-radius: 28px;
+}
+
+.relationship-score.positive {
+  background: linear-gradient(135deg, #0f766e, #22c55e);
+}
+
+.relationship-score.negative {
+  background: linear-gradient(135deg, #b91c1c, #f97316);
+}
+
+.relationship-labels {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  color: #344054;
+  font-weight: 800;
+}
+
+@media (max-width: 900px) {
+  .story-card-relationship,
+  .story-card-missingness,
+  .story-card-distribution {
+    grid-column: auto;
+  }
+
+  .relationship-story-chart,
+  .story-card > .donut-card {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 560px) {
+  .timeline-chart {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }

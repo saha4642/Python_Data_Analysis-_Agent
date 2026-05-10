@@ -7,6 +7,7 @@ import * as XLSX from "xlsx";
 
 type DataRow = Record<string, string | number | boolean | null>;
 type ColumnKind = "numeric" | "date" | "boolean" | "text";
+type VisualizationKind = "quality" | "typeMix" | "missingness" | "distribution" | "category" | "timeline" | "relationship";
 
 type ColumnProfile = {
   name: string;
@@ -23,6 +24,7 @@ type ColumnProfile = {
   q1?: number;
   q3?: number;
   histogram?: Array<{ start: number; end: number; count: number; percent: number }>;
+  timeline?: Array<{ label: string; count: number; percent: number }>;
   topValues: Array<{ value: string; count: number; percent: number }>;
 };
 
@@ -35,8 +37,21 @@ type DatasetAnalysis = {
   profiles: ColumnProfile[];
   numericProfiles: ColumnProfile[];
   textProfiles: ColumnProfile[];
+  dateProfiles: ColumnProfile[];
+  categoryProfiles: ColumnProfile[];
   insights: string[];
   correlations: Array<{ left: string; right: string; value: number }>;
+};
+
+type VisualizationStory = {
+  kind: VisualizationKind;
+  title: string;
+  kicker: string;
+  why: string;
+  priority: number;
+  profile?: ColumnProfile;
+  profiles?: ColumnProfile[];
+  correlation?: DatasetAnalysis["correlations"][number];
 };
 
 const MAX_ROWS = 10000;
@@ -105,6 +120,29 @@ function buildHistogram(sorted: number[], bucketCount = 8): ColumnProfile["histo
   return buckets.map((bucket) => ({ ...bucket, percent: (bucket.count / sorted.length) * 100 }));
 }
 
+function buildTimeline(values: number[], bucketCount = 8): ColumnProfile["timeline"] {
+  if (!values.length) return [];
+  const sorted = [...values].sort((a, b) => a - b);
+  const min = sorted[0];
+  const max = sorted[sorted.length - 1];
+
+  if (min === max) {
+    return [{ label: new Date(min).toLocaleDateString(), count: sorted.length, percent: 100 }];
+  }
+
+  const buckets = Array.from({ length: bucketCount }, (_, index) => {
+    const start = min + ((max - min) / bucketCount) * index;
+    return { label: new Date(start).toLocaleDateString(undefined, { month: "short", year: "2-digit" }), count: 0, percent: 0 };
+  });
+
+  sorted.forEach((value) => {
+    const bucketIndex = clamp(Math.floor(((value - min) / (max - min)) * bucketCount), 0, bucketCount - 1);
+    buckets[bucketIndex].count += 1;
+  });
+
+  return buckets.map((bucket) => ({ ...bucket, percent: (bucket.count / sorted.length) * 100 }));
+}
+
 function inferKind(values: Array<string | number | boolean | null>): ColumnKind {
   const present = values.filter((value) => value !== null);
   if (!present.length) return "text";
@@ -162,6 +200,14 @@ function profileColumn(name: string, rows: DataRow[]): ColumnProfile {
     };
   }
 
+  if (kind === "date") {
+    const dates = present.map(asDate).filter((value): value is number => value !== null);
+    return {
+      ...base,
+      timeline: buildTimeline(dates),
+    };
+  }
+
   return base;
 }
 
@@ -200,6 +246,8 @@ function analyzeRows(rows: DataRow[], fileName: string): DatasetAnalysis {
   const profiles = columns.map((column) => profileColumn(column, cleanedRows));
   const numericProfiles = profiles.filter((profile) => profile.kind === "numeric");
   const textProfiles = profiles.filter((profile) => profile.kind !== "numeric");
+  const dateProfiles = profiles.filter((profile) => profile.kind === "date");
+  const categoryProfiles = profiles.filter((profile) => ["text", "boolean"].includes(profile.kind) && profile.topValues.length > 0 && profile.unique > 1);
   const totalCells = Math.max(cleanedRows.length * columns.length, 1);
   const missingCells = profiles.reduce((sum, profile) => sum + profile.missing, 0);
   const duplicateRows = cleanedRows.length - new Set(cleanedRows.map((row) => JSON.stringify(row))).size;
@@ -227,6 +275,8 @@ function analyzeRows(rows: DataRow[], fileName: string): DatasetAnalysis {
     profiles,
     numericProfiles,
     textProfiles,
+    dateProfiles,
+    categoryProfiles,
     correlations,
     insights,
   };
@@ -255,6 +305,108 @@ function buildInsights(
   }
   if (insights.length === 1) insights.push("The data looks compact and mostly categorical. Start by reviewing top values and missingness before deeper analysis.");
   return insights;
+}
+
+function missingPercent(profile: ColumnProfile): number {
+  return (profile.missing / Math.max(profile.total, 1)) * 100;
+}
+
+function distributionStoryScore(profile: ColumnProfile): number {
+  const spread = profile.max !== undefined && profile.min !== undefined ? Math.abs(profile.max - profile.min) : 0;
+  const iqr = profile.q3 !== undefined && profile.q1 !== undefined ? Math.abs(profile.q3 - profile.q1) : 0;
+  const variability = profile.stdev !== undefined && profile.mean !== undefined ? profile.stdev / Math.max(Math.abs(profile.mean), 1) : 0;
+  const outlierSignal = iqr > 0 ? spread / iqr : 0;
+  return variability + outlierSignal + missingPercent(profile) / 100;
+}
+
+function categoryStoryScore(profile: ColumnProfile): number {
+  const leaderShare = profile.topValues[0]?.percent ?? 0;
+  const usefulDiversity = profile.unique > 1 && profile.unique <= Math.max(30, profile.total * 0.35) ? 20 : 0;
+  return leaderShare + usefulDiversity + missingPercent(profile) / 4;
+}
+
+function buildVisualizationStories(analysis: DatasetAnalysis): VisualizationStory[] {
+  const stories: VisualizationStory[] = [];
+  const missingProfiles = [...analysis.profiles].filter((profile) => profile.missing > 0).sort((a, b) => missingPercent(b) - missingPercent(a));
+  const bestDistribution = [...analysis.numericProfiles].filter((profile) => profile.histogram?.length).sort((a, b) => distributionStoryScore(b) - distributionStoryScore(a))[0];
+  const bestCategory = [...analysis.categoryProfiles].sort((a, b) => categoryStoryScore(b) - categoryStoryScore(a))[0];
+  const bestTimeline = analysis.dateProfiles.find((profile) => profile.timeline?.length);
+  const bestCorrelation = analysis.correlations[0];
+
+  stories.push({
+    kind: "quality",
+    title: "Start with trust in the data",
+    kicker: "Data readiness",
+    why: analysis.completeness >= 98 && analysis.duplicateRows === 0
+      ? "The file is highly complete, so the story can focus on patterns rather than cleanup caveats."
+      : "Completeness and duplicate checks set context before interpreting any trend, segment, or relationship.",
+    priority: analysis.completeness < 98 || analysis.duplicateRows > 0 ? 98 : 45,
+  });
+
+  if (bestCorrelation) {
+    stories.push({
+      kind: "relationship",
+      title: `${bestCorrelation.left} moves ${bestCorrelation.value >= 0 ? "with" : "against"} ${bestCorrelation.right}`,
+      kicker: "Relationship",
+      why: `This is the strongest numeric relationship found, making it a natural lead for explaining drivers or tradeoffs (r = ${formatNumber(bestCorrelation.value, 2)}).`,
+      priority: 92 + Math.abs(bestCorrelation.value),
+      correlation: bestCorrelation,
+    });
+  }
+
+  if (bestTimeline) {
+    stories.push({
+      kind: "timeline",
+      title: `Use ${bestTimeline.name} to tell the story over time`,
+      kicker: "Trend",
+      why: "Time-based fields are usually the clearest way to show momentum, seasonality, spikes, or data collection gaps.",
+      priority: 88,
+      profile: bestTimeline,
+    });
+  }
+
+  if (bestCategory) {
+    stories.push({
+      kind: "category",
+      title: `${bestCategory.name} explains the main segments`,
+      kicker: "Composition",
+      why: "A ranked category chart highlights who or what dominates the dataset and gives the audience easy comparison points.",
+      priority: 82 + Math.min(categoryStoryScore(bestCategory) / 100, 1),
+      profile: bestCategory,
+    });
+  }
+
+  if (bestDistribution) {
+    stories.push({
+      kind: "distribution",
+      title: `${bestDistribution.name} shows the spread and outliers`,
+      kicker: "Distribution",
+      why: "A histogram plus box plot reveals skew, concentration, and unusual values before averages are overinterpreted.",
+      priority: 78 + Math.min(distributionStoryScore(bestDistribution), 10),
+      profile: bestDistribution,
+    });
+  }
+
+  if (missingProfiles.length) {
+    stories.push({
+      kind: "missingness",
+      title: "Missingness is part of the story",
+      kicker: "Data quality",
+      why: "Columns with the largest gaps can explain weak conclusions, biased comparisons, or where cleaning will have the highest impact.",
+      priority: 72 + Math.min(missingPercent(missingProfiles[0]) / 10, 10),
+      profiles: missingProfiles,
+    });
+  }
+
+  stories.push({
+    kind: "typeMix",
+    title: "Schema shape guides the right charts",
+    kicker: "Chart selection",
+    why: "The mix of numeric, date, boolean, and text fields determines whether the dashboard should emphasize trends, comparisons, distributions, or relationships.",
+    priority: 35,
+  });
+
+  return stories.sort((a, b) => b.priority - a.priority).slice(0, 5);
 }
 
 async function parseFile(file: File): Promise<DataRow[]> {
@@ -458,87 +610,128 @@ function MissingnessChart({ profiles }: { profiles: ColumnProfile[] }) {
   );
 }
 
-function DistributionCharts({ profiles }: { profiles: ColumnProfile[] }) {
-  const chartProfiles = profiles.filter((profile) => profile.histogram?.length).slice(0, 4);
-  if (!chartProfiles.length) return null;
-
-  return (
-    <article className="viz-card wide-viz-card">
-      <div className="viz-card-heading">
-        <h3>Numeric distributions</h3>
-        <span>Histograms</span>
-      </div>
-      <div className="histogram-grid">
-        {chartProfiles.map((profile) => {
-          const maxCount = Math.max(...(profile.histogram ?? []).map((bucket) => bucket.count), 1);
-          return (
-            <div className="histogram-card" key={profile.name}>
-              <div className="histogram-title">
-                <strong>{profile.name}</strong>
-                <span>{formatNumber(profile.min)} → {formatNumber(profile.max)}</span>
-              </div>
-              <div className="histogram-bars" aria-label={`${profile.name} distribution histogram`}>
-                {profile.histogram?.map((bucket) => (
-                  <span
-                    key={`${bucket.start}-${bucket.end}`}
-                    style={{ height: `${Math.max((bucket.count / maxCount) * 100, bucket.count ? 8 : 2)}%` }}
-                    title={`${formatNumber(bucket.start)} to ${formatNumber(bucket.end)}: ${bucket.count}`}
-                  />
-                ))}
-              </div>
-              <div className="boxplot" aria-label={`${profile.name} box plot`}>
-                <span className="whisker" style={{ left: "0%", width: "100%" }} />
-                <span className="box" style={{ left: `${percentAlong(profile.q1, profile.min, profile.max)}%`, width: `${Math.max(percentAlong(profile.q3, profile.min, profile.max) - percentAlong(profile.q1, profile.min, profile.max), 2)}%` }} />
-                <span className="median" style={{ left: `${percentAlong(profile.median, profile.min, profile.max)}%` }} />
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </article>
-  );
-}
-
 function percentAlong(value?: number, min?: number, max?: number): number {
   if (value === undefined || min === undefined || max === undefined || min === max) return 0;
   return clamp(((value - min) / (max - min)) * 100, 0, 100);
 }
 
-function CorrelationHeatmap({ correlations }: { correlations: DatasetAnalysis["correlations"] }) {
-  if (!correlations.length) return null;
+function StoryWhy({ story }: { story: VisualizationStory }) {
+  return (
+    <div className="story-why">
+      <span>{story.kicker}</span>
+      <p>{story.why}</p>
+    </div>
+  );
+}
+
+function DistributionProfileChart({ profile }: { profile: ColumnProfile }) {
+  const maxCount = Math.max(...(profile.histogram ?? []).map((bucket) => bucket.count), 1);
 
   return (
-    <article className="viz-card wide-viz-card">
+    <div className="histogram-card story-chart-card">
+      <div className="histogram-title">
+        <strong>{profile.name}</strong>
+        <span>{formatNumber(profile.min)} → {formatNumber(profile.max)}</span>
+      </div>
+      <div className="histogram-bars" aria-label={`${profile.name} best-fit distribution histogram`}>
+        {profile.histogram?.map((bucket) => (
+          <span
+            key={`${bucket.start}-${bucket.end}`}
+            style={{ height: `${Math.max((bucket.count / maxCount) * 100, bucket.count ? 8 : 2)}%` }}
+            title={`${formatNumber(bucket.start)} to ${formatNumber(bucket.end)}: ${bucket.count}`}
+          />
+        ))}
+      </div>
+      <div className="boxplot" aria-label={`${profile.name} box plot`}>
+        <span className="whisker" style={{ left: "0%", width: "100%" }} />
+        <span className="box" style={{ left: `${percentAlong(profile.q1, profile.min, profile.max)}%`, width: `${Math.max(percentAlong(profile.q3, profile.min, profile.max) - percentAlong(profile.q1, profile.min, profile.max), 2)}%` }} />
+        <span className="median" style={{ left: `${percentAlong(profile.median, profile.min, profile.max)}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function CategoryStoryChart({ profile }: { profile: ColumnProfile }) {
+  return (
+    <div className="story-category-chart">
+      {profile.topValues.map((item) => (
+        <div className="bar-row" key={item.value}>
+          <div className="bar-label"><span>{item.value}</span><strong>{formatNumber(item.percent)}%</strong></div>
+          <div className="bar-track"><span style={{ width: `${Math.max(item.percent, 3)}%` }} /></div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function TimelineStoryChart({ profile }: { profile: ColumnProfile }) {
+  const maxCount = Math.max(...(profile.timeline ?? []).map((bucket) => bucket.count), 1);
+
+  return (
+    <div className="timeline-chart" aria-label={`${profile.name} timeline distribution`}>
+      {profile.timeline?.map((bucket) => (
+        <div className="timeline-bucket" key={bucket.label}>
+          <span style={{ height: `${Math.max((bucket.count / maxCount) * 100, bucket.count ? 8 : 2)}%` }} title={`${bucket.label}: ${bucket.count}`} />
+          <small>{bucket.label}</small>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function RelationshipStoryChart({ correlation }: { correlation: DatasetAnalysis["correlations"][number] }) {
+  const width = Math.max(Math.abs(correlation.value) * 100, 3);
+
+  return (
+    <div className="relationship-story-chart">
+      <div className={`relationship-score ${correlation.value >= 0 ? "positive" : "negative"}`}>{formatNumber(correlation.value, 2)}</div>
+      <div>
+        <div className="relationship-labels"><span>{correlation.left}</span><span>{correlation.right}</span></div>
+        <div className="correlation-track"><span style={{ width: `${width}%` }} /></div>
+      </div>
+    </div>
+  );
+}
+
+function StoryVisualizationCard({ story, analysis }: { story: VisualizationStory; analysis: DatasetAnalysis }) {
+  return (
+    <article className={`viz-card story-card story-card-${story.kind}`}>
       <div className="viz-card-heading">
-        <h3>Correlation heatmap</h3>
-        <span>Strongest pairs</span>
+        <h3>{story.title}</h3>
+        <span>{story.kicker}</span>
       </div>
-      <div className="heatmap-grid">
-        {correlations.map((item) => {
-          const strength = Math.abs(item.value);
-          return (
-            <div className={`heatmap-cell ${item.value >= 0 ? "positive" : "negative"}`} key={`${item.left}-${item.right}`} style={{ opacity: 0.35 + strength * 0.65 }}>
-              <span>{item.left}</span>
-              <strong>{formatNumber(item.value, 2)}</strong>
-              <span>{item.right}</span>
-            </div>
-          );
-        })}
-      </div>
+
+      {story.kind === "quality" && <DonutGauge value={analysis.completeness} label="Complete cells" />}
+      {story.kind === "relationship" && story.correlation && <RelationshipStoryChart correlation={story.correlation} />}
+      {story.kind === "timeline" && story.profile && <TimelineStoryChart profile={story.profile} />}
+      {story.kind === "category" && story.profile && <CategoryStoryChart profile={story.profile} />}
+      {story.kind === "distribution" && story.profile && <DistributionProfileChart profile={story.profile} />}
+      {story.kind === "missingness" && <MissingnessChart profiles={story.profiles ?? analysis.profiles} />}
+      {story.kind === "typeMix" && <TypeMixChart profiles={analysis.profiles} />}
+
+      <StoryWhy story={story} />
     </article>
   );
 }
 
 function VisualizationDashboard({ analysis }: { analysis: DatasetAnalysis }) {
+  const stories = buildVisualizationStories(analysis);
+
   return (
     <section className="report-section visualization-section">
-      <div className="section-heading"><h2>Important visualizations</h2><p>High-signal graphs for completeness, schema shape, numeric distributions, and relationships.</p></div>
-      <div className="visualization-grid">
-        <DonutGauge value={analysis.completeness} label="Complete cells" />
-        <TypeMixChart profiles={analysis.profiles} />
-        <MissingnessChart profiles={analysis.profiles} />
-        <DistributionCharts profiles={analysis.numericProfiles} />
-        <CorrelationHeatmap correlations={analysis.correlations} />
+      <div className="section-heading">
+        <h2>Best-fit storytelling visuals</h2>
+        <p>Automatically prioritized from the uploaded data so the report leads with the charts that best explain quality, trends, segments, distributions, and relationships.</p>
+      </div>
+      <div className="story-board">
+        <div className="story-lead">
+          <p className="eyebrow">Recommended narrative</p>
+          <h3>Show what matters first</h3>
+          <p>These visuals are selected from the columns and patterns detected in this file instead of showing every possible chart with equal weight.</p>
+        </div>
+        <div className="visualization-grid story-grid">
+          {stories.map((story) => <StoryVisualizationCard key={`${story.kind}-${story.title}`} story={story} analysis={analysis} />)}
+        </div>
       </div>
     </section>
   );
