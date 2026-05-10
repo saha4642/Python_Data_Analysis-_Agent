@@ -516,3 +516,282 @@ dd {
     grid-template-columns: repeat(2, 1fr);
   }
 }
+
+.visualization-section {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.94), rgba(238, 244, 255, 0.82));
+}
+
+.visualization-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.viz-card {
+  min-width: 0;
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: 24px;
+  background: #ffffff;
+  box-shadow: 0 12px 34px rgba(16, 24, 40, 0.06);
+}
+
+.wide-viz-card {
+  grid-column: 1 / -1;
+}
+
+.viz-card-heading,
+.histogram-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.viz-card-heading h3,
+.histogram-title strong {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.viz-card-heading span,
+.histogram-title span,
+.donut-card p {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.donut-card {
+  display: grid;
+  grid-template-columns: 150px 1fr;
+  gap: 20px;
+  align-items: center;
+}
+
+.donut {
+  display: grid;
+  width: 150px;
+  height: 150px;
+  place-items: center;
+  text-align: center;
+  border-radius: 50%;
+  background: conic-gradient(var(--accent) var(--value), #eef2f6 0);
+}
+
+.donut::before {
+  grid-area: 1 / 1;
+  width: 108px;
+  height: 108px;
+  content: "";
+  border-radius: 50%;
+  background: #ffffff;
+}
+
+.donut strong,
+.donut span {
+  z-index: 1;
+  grid-area: 1 / 1;
+}
+
+.donut strong {
+  margin-top: -18px;
+  font-size: 2rem;
+  letter-spacing: -0.05em;
+}
+
+.donut span {
+  align-self: end;
+  margin-bottom: 42px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.stacked-bar {
+  display: flex;
+  overflow: hidden;
+  height: 28px;
+  border-radius: 999px;
+  background: #eef2f6;
+}
+
+.stacked-bar span {
+  min-width: 4px;
+}
+
+.legend-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 18px;
+  color: #475467;
+  font-size: 0.9rem;
+}
+
+.legend-grid span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.legend-grid i {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+}
+
+.numeric { background: #3b82f6; }
+.date { background: #16b8a6; }
+.boolean { background: #f59e0b; }
+.text { background: #8b5cf6; }
+
+.missing-chart {
+  display: grid;
+  gap: 12px;
+}
+
+.missing-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.9fr) minmax(160px, 2fr) 64px;
+  gap: 12px;
+  align-items: center;
+  color: #344054;
+}
+
+.missing-row > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.missing-row strong {
+  text-align: right;
+}
+
+.missing-track {
+  overflow: hidden;
+  height: 12px;
+  border-radius: 999px;
+  background: #eef2f6;
+}
+
+.missing-track i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #f59e0b, #ef4444);
+}
+
+.histogram-grid,
+.heatmap-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.histogram-card {
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  background: #f9fafb;
+}
+
+.histogram-bars {
+  display: flex;
+  align-items: end;
+  height: 140px;
+  gap: 6px;
+  padding: 10px;
+  border-radius: 16px;
+  background: linear-gradient(180deg, #ffffff, #eef4ff);
+}
+
+.histogram-bars span {
+  flex: 1;
+  min-width: 8px;
+  border-radius: 8px 8px 2px 2px;
+  background: linear-gradient(180deg, var(--primary), var(--accent));
+}
+
+.boxplot {
+  position: relative;
+  height: 28px;
+  margin-top: 14px;
+}
+
+.boxplot .whisker,
+.boxplot .box,
+.boxplot .median {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.boxplot .whisker {
+  height: 2px;
+  background: #98a2b3;
+}
+
+.boxplot .box {
+  height: 18px;
+  border: 2px solid var(--primary);
+  border-radius: 7px;
+  background: rgba(49, 88, 245, 0.16);
+}
+
+.boxplot .median {
+  width: 3px;
+  height: 24px;
+  border-radius: 999px;
+  background: #101828;
+}
+
+.heatmap-cell {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  gap: 10px;
+  align-items: center;
+  padding: 16px;
+  color: #ffffff;
+  border-radius: 18px;
+}
+
+.heatmap-cell.positive {
+  background: linear-gradient(135deg, #0f766e, #22c55e);
+}
+
+.heatmap-cell.negative {
+  background: linear-gradient(135deg, #b91c1c, #f97316);
+}
+
+.heatmap-cell strong {
+  font-size: 1.35rem;
+}
+
+.heatmap-cell span:last-child {
+  text-align: right;
+}
+
+@media (max-width: 900px) {
+  .visualization-grid,
+  .histogram-grid,
+  .heatmap-grid,
+  .donut-card {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 560px) {
+  .missing-row,
+  .heatmap-cell {
+    grid-template-columns: 1fr;
+  }
+
+  .missing-row strong,
+  .heatmap-cell span:last-child {
+    text-align: left;
+  }
+}
