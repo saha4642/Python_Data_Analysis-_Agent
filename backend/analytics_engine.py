@@ -52,7 +52,7 @@ app.add_middleware(
 
 class TestRequest(BaseModel):
     dataset_id: str
-    test: Literal["ttest", "anova", "chi_square", "mann_whitney", "kruskal"]
+    test: Literal["pearson", "spearman", "ttest", "anova", "chi_square", "mann_whitney", "kruskal"]
     numeric: str | None = None
     group: str | None = None
     left: str | None = None
@@ -113,9 +113,10 @@ def clean_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def column_groups(df: pd.DataFrame) -> ColumnGroups:
-    numeric = df.select_dtypes(include=np.number).columns.tolist()
     datetime = df.select_dtypes(include=["datetime", "datetimetz"]).columns.tolist()
-    boolean = df.select_dtypes(include="bool").columns.tolist()
+    binary = [col for col in df.columns if col not in datetime and df[col].dropna().nunique() == 2]
+    numeric = [col for col in df.select_dtypes(include=np.number).columns.tolist() if col not in binary]
+    boolean = sorted(set(df.select_dtypes(include="bool").columns.tolist() + binary))
     categorical = [col for col in df.columns if col not in numeric + datetime + boolean]
     return ColumnGroups(numeric=numeric, categorical=categorical, datetime=datetime, boolean=boolean)
 
@@ -151,13 +152,15 @@ def profile_dataset(df: pd.DataFrame) -> dict[str, Any]:
             values = pd.to_numeric(series, errors="coerce")
             item.update(
                 mean=float(values.mean()), median=float(values.median()), mode=str(values.mode().iloc[0]) if not values.mode().empty else None,
-                std=float(values.std()), variance=float(values.var()), range=float(values.max() - values.min()),
-                iqr=float(values.quantile(0.75) - values.quantile(0.25)), skewness=float(values.skew()), kurtosis=float(values.kurt()),
-                outliers=outlier_summary(values),
+                std=float(values.std()), variance=float(values.var()), min=float(values.min()), max=float(values.max()), range=float(values.max() - values.min()),
+                q1=float(values.quantile(0.25)), q3=float(values.quantile(0.75)), iqr=float(values.quantile(0.75) - values.quantile(0.25)),
+                skewness=float(values.skew()), kurtosis=float(values.kurt()), outliers=outlier_summary(values),
+                insight=f"{column} averages {values.mean():.2f} with a median of {values.median():.2f}; review skewness and outliers before using it in models.",
             )
         else:
             counts = series.astype(str).value_counts(dropna=True).head(20)
             item["frequency_table"] = [{"value": key, "count": int(value), "percent": float(value / max(series.notna().sum(), 1) * 100)} for key, value in counts.items()]
+            item["insight"] = f"{column} has {series.nunique(dropna=True)} observed levels; compare dominant and rare categories before testing relationships."
         profiles.append(item)
 
     corr = df[groups.numeric].corr(method="pearson").fillna(0).to_dict() if len(groups.numeric) > 1 else {}
@@ -230,24 +233,40 @@ def statistical_test(request: TestRequest) -> dict[str, Any]:
     df = DATASET_CACHE.get(request.dataset_id)
     if df is None:
         raise HTTPException(status_code=404, detail="Dataset not found in cache.")
+    if request.test in {"pearson", "spearman"}:
+        if not request.left or not request.right:
+            raise HTTPException(status_code=400, detail="left and right numeric variables are required.")
+        pair = df[[request.left, request.right]].apply(pd.to_numeric, errors="coerce").dropna()
+        result = stats.pearsonr(pair[request.left], pair[request.right]) if request.test == "pearson" else stats.spearmanr(pair[request.left], pair[request.right])
+        return {"test": request.test, "statistic": float(result.statistic), "p_value": float(result.pvalue), "n": int(len(pair)), "assumptions": "Pearson expects linear numeric relationships; Spearman expects monotonic ordinal/numeric relationships.", "interpretation": f"The relationship is {'statistically significant' if result.pvalue < 0.05 else 'not statistically significant'} at alpha=.05."}
     if request.test == "chi_square":
         if not request.left or not request.right:
             raise HTTPException(status_code=400, detail="left and right are required.")
         table = pd.crosstab(df[request.left], df[request.right])
+        if table.shape[0] < 2 or table.shape[1] < 2:
+            raise HTTPException(status_code=400, detail="Chi-square requires at least two levels in each categorical variable.")
         chi2, p, dof, expected = stats.chi2_contingency(table)
-        return {"test": "chi_square", "chi2": chi2, "p_value": p, "dof": dof, "expected": expected.tolist()}
+        return {"test": "chi_square", "statistic": float(chi2), "p_value": float(p), "dof": int(dof), "observed": table.to_dict(), "expected": expected.tolist(), "assumptions": "Independent observations and sufficiently large expected cell counts.", "interpretation": f"The categorical variables are {'associated' if p < 0.05 else 'not detectably associated'} at alpha=.05."}
     if not request.numeric or not request.group:
         raise HTTPException(status_code=400, detail="numeric and group are required.")
-    groups = [pd.to_numeric(part[request.numeric], errors="coerce").dropna() for _, part in df.groupby(request.group)]
+    groups = [pd.to_numeric(part[request.numeric], errors="coerce").dropna() for _, part in df.groupby(request.group) if len(part) > 1]
+    if request.test in {"ttest", "mann_whitney"} and len(groups) < 2:
+        raise HTTPException(status_code=400, detail="This test requires at least two groups.")
+    if request.test in {"anova", "kruskal"} and len(groups) < 2:
+        raise HTTPException(status_code=400, detail="This test requires at least two groups.")
     if request.test == "ttest":
         result = stats.ttest_ind(groups[0], groups[1], equal_var=False, nan_policy="omit")
+        assumptions = "Two independent groups, numeric outcome, approximate normality; Welch t-test relaxes equal variances."
     elif request.test == "anova":
         result = stats.f_oneway(*groups)
+        assumptions = "Independent groups, numeric outcome, approximately normal residuals, and similar variances."
     elif request.test == "mann_whitney":
         result = stats.mannwhitneyu(groups[0], groups[1], alternative="two-sided")
+        assumptions = "Two independent groups and ordinal/numeric outcome; non-parametric alternative to t-test."
     else:
         result = stats.kruskal(*groups)
-    return {"test": request.test, "statistic": float(result.statistic), "p_value": float(result.pvalue), "groups": len(groups)}
+        assumptions = "Independent groups and ordinal/numeric outcome; non-parametric alternative to ANOVA."
+    return {"test": request.test, "statistic": float(result.statistic), "p_value": float(result.pvalue), "groups": len(groups), "assumptions": assumptions, "interpretation": f"The result is {'statistically significant' if result.pvalue < 0.05 else 'not statistically significant'} at alpha=.05; inspect group plots and effect sizes next."}
 
 
 @app.post("/visualizations")
@@ -309,13 +328,18 @@ def train_model(request: ModelRequest) -> dict[str, Any]:
     predictions = pipeline.predict(x_test)
     if request.task == "regression":
         model = sm.OLS(pd.to_numeric(y_train, errors="coerce"), sm.add_constant(pd.get_dummies(x_train, drop_first=True).apply(pd.to_numeric, errors="coerce").fillna(0))).fit()
+        residual_fig = px.scatter(x=model.fittedvalues, y=model.resid, labels={"x": "Fitted values", "y": "Residuals"}, title="Residual plot")
+        residual_fig.add_hline(y=0, line_dash="dash")
         return {
             "task": "regression",
             "r2": float(r2_score(y_test, predictions)),
             "rmse": float(mean_squared_error(y_test, predictions, squared=False)),
             "mae": float(mean_absolute_error(y_test, predictions)),
-            "cross_validation_r2": cross_val_score(pipeline, modeling_df[features], modeling_df[request.target], cv=5, scoring="r2").tolist(),
+            "coefficients": [{"term": str(term), "coefficient": float(coef), "p_value": float(model.pvalues.loc[term])} for term, coef in model.params.items()],
+            "cross_validation_r2": cross_val_score(pipeline, modeling_df[features], modeling_df[request.target], cv=min(5, len(modeling_df)), scoring="r2").tolist(),
             "diagnostics": {"aic": float(model.aic), "bic": float(model.bic), "residual_std": float(model.resid.std())},
+            "residual_plot": json.loads(residual_fig.to_json()),
+            "interpretation": "Positive coefficients increase the expected outcome while negative coefficients decrease it, holding encoded predictors constant. Review p-values and residual structure before reporting.",
         }
     probabilities = pipeline.predict_proba(x_test)[:, 1] if hasattr(pipeline.named_steps["model"], "predict_proba") and len(np.unique(y_test)) == 2 else None
     return {
@@ -323,7 +347,8 @@ def train_model(request: ModelRequest) -> dict[str, Any]:
         "accuracy": float(accuracy_score(y_test, predictions)),
         "roc_auc": float(roc_auc_score(y_test, probabilities)) if probabilities is not None else None,
         "confusion_matrix": confusion_matrix(y_test, predictions).tolist(),
-        "cross_validation_accuracy": cross_val_score(pipeline, modeling_df[features], modeling_df[request.target], cv=5, scoring="accuracy").tolist(),
+        "cross_validation_accuracy": cross_val_score(pipeline, modeling_df[features], modeling_df[request.target], cv=min(5, len(modeling_df)), scoring="accuracy").tolist(),
+        "interpretation": "Accuracy summarizes held-out classification performance; inspect the confusion matrix to identify which class is being missed and use ROC AUC for binary discrimination quality.",
     }
 
 
