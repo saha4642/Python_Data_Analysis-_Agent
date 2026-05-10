@@ -12,9 +12,9 @@ The product is designed to feel like an enterprise analytics platform inspired b
 - **Automatic EDA** for numerical, categorical, boolean, and datetime columns, missing values, duplicates, outliers, top values, descriptive statistics, and correlation signals.
 - **Inferential statistics** for Pearson/Spearman correlation, t-tests, ANOVA, chi-square, Mann-Whitney U, and Kruskal-Wallis.
 - **Regression and ML modules** for linear regression, logistic regression, Random Forest, Decision Tree, KNN, and SVM with train/test split, cross-validation, diagnostics, confusion matrices, accuracy, ROC AUC, and regression errors.
-- **Plotly visualization API** for histograms, KDE-style distributions, box/violin plots, scatter and regression plots, line/area/bar/count/pie/stacked charts, heatmaps, pair plots, joint/hexbin-style scatter, 3D scatter, and geospatial charts.
+- **Plotly visualization workspace** for histograms, KDE-style distributions, box/violin plots, scatter and regression plots, line/area/bar/count/grouped/stacked charts, heatmaps, pair plot approximations, area charts, pie charts, and 3D scatter when enough numeric columns exist.
 - **AI insights layer** that summarizes data quality, trends, anomalies, correlations, and modeling recommendations.
-- **Export-ready reports** for PNG/SVG, CSV, HTML, and PDF-compatible HTML payloads.
+- **Export-ready reports** for PNG placeholders, CSV profiles, HTML reports, PDF-compatible HTML payloads, and Plotly chart HTML snippets.
 
 ## Folder structure
 
@@ -38,9 +38,18 @@ README.md                  # Documentation and deployment guide
 
 ## Running the full analysis app
 
-Run the Python analytics API and the Next.js UI in two terminals so uploads can be profiled, tested, modeled, visualized, and exported end-to-end.
+The app now computes the assignment sections from the uploaded rows in the browser immediately after upload. The optional FastAPI backend remains available for API-based workflows, including SciPy-backed `chi2_contingency`, but the visible dashboard no longer depends on static roadmap cards.
 
-### Terminal 1: analytics backend
+### Terminal 1: install and run the Next.js app
+
+```bash
+npm install
+npm run dev
+```
+
+Open <http://localhost:3000>, upload a CSV/XLSX/JSON file, and use the controls for descriptive statistics, categorical cross-tabs, hypothesis tests, regression models, and Plotly visualizations. Plotly is loaded in the browser from the official Plotly CDN when the visualization panel renders.
+
+### Optional Terminal 2: analytics backend
 
 ```bash
 python -m venv .venv
@@ -49,25 +58,24 @@ pip install -r requirements.txt
 npm run backend
 ```
 
-The backend uses Pandas, NumPy, SciPy, Statsmodels, Scikit-learn, and Plotly to compute column-type detection, descriptive statistics, frequency tables, Chi-square tests, Pearson/Spearman correlations, t-tests, ANOVA, Mann-Whitney U, Kruskal-Wallis, linear/logistic modeling metrics, residual plots, and Plotly chart payloads.
-
-### Terminal 2: Next.js frontend
-
-```bash
-npm install
-NEXT_PUBLIC_ANALYTICS_API_URL=http://localhost:8000 npm run dev
-```
-
-Open <http://localhost:3000>, upload a CSV/XLSX/JSON file, and use the dashboard controls to select x-axis, y-axis, grouping column, chart type, categorical variables, and model variables. Every analysis panel now produces computed output from the uploaded rows instead of a static roadmap.
+The backend runs at <http://localhost:8000> and exposes reusable Pandas/SciPy/Statsmodels/Scikit-learn endpoints for uploads, Chi-square, Pearson/Spearman, t-tests, ANOVA, Mann-Whitney U, Kruskal-Wallis, Plotly JSON, and model training.
 
 ### Student performance smoke test
 
-Use `student-mat.csv` from the UCI Student Performance dataset. After upload, verify:
+Use `student-mat.csv` from the UCI Student Performance dataset. After upload, verify these exact UI outputs:
 
-- `age`, `Medu`, and `Fedu` are detected as numeric fields with mean, median, mode, standard deviation, variance, range, IQR, min, max, skewness, kurtosis, histograms, and regression/correlation options.
-- `school`, `sex`, and `address` are detected as categorical/binary fields with frequency counts, percentages, count/bar/pie charts, cross-tabulation, expected frequencies, and Chi-square interpretation.
-- Select `age` as x-axis, `Medu` or `Fedu` as y-axis, and `sex` or `address` as the group to generate Pearson, Spearman, t-test, ANOVA, Mann-Whitney U, Kruskal-Wallis, scatter/regression charts, grouped bars, and residual plots.
-- Use **Download SVG** or the report export buttons to save generated visualizations and analysis summaries.
+- **Descriptive Statistics** shows numeric rows for `age`, `Medu`, and `Fedu` with mean, median, mode, standard deviation, variance, min, max, range, IQR, skewness, kurtosis, and missing count.
+- **Categorical columns** shows frequency tables and percentages for `school`, `sex`, and `address`.
+- **Categorical relationship analysis**: select `school` and `sex` to display the observed cross-tab, expected frequencies, Chi-square statistic, p-value, degrees of freedom, and plain-English interpretation.
+- **Inferential statistics**: select Pearson correlation with `age` and `Medu` to display statistic, p-value, paired sample size, assumptions, and interpretation.
+- **Visualization studio**: select a box/violin/grouped bar chart by `school`, and select the heatmap option to render the numeric correlation matrix.
+- **Regression modeling**: select multiple linear regression, target `age`, and predictors `Medu` and `Fedu` to display coefficients, intercept, R², p-values, residual summary, sample size, and interpretation.
+
+### Production build check
+
+```bash
+npm run build
+```
 
 ## Local development
 
@@ -134,7 +142,7 @@ Returns Plotly JSON for supported charts:
 - Scatter and regression plots
 - Line, area, bar, count, pie, and stacked bar charts
 - Heatmap correlation matrix
-- Pair plot and joint-style plots
+- Pair plot approximations and 3D scatter plots
 - Hexbin-style scatter
 - 3D scatter
 - Geospatial scatter
