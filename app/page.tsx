@@ -7,7 +7,7 @@ import * as XLSX from "xlsx";
 
 type DataValue = string | number | boolean | null;
 type DataRow = Record<string, DataValue>;
-type ColumnKind = "numeric" | "categorical" | "datetime" | "boolean" | "text";
+type ColumnKind = "numeric" | "categorical" | "datetime" | "boolean" | "binary" | "text";
 type ThemeMode = "light" | "dark";
 type ActiveSection =
   | "Dashboard"
@@ -147,8 +147,8 @@ function inferKind(values: DataValue[]): ColumnKind {
   const dateRatio = present.filter((value) => asDate(value) !== null).length / present.length;
   const booleanRatio = present.filter((value) => typeof value === "boolean" || ["true", "false", "yes", "no"].includes(String(value).toLowerCase())).length / present.length;
   const uniqueRatio = new Set(present.map(String)).size / present.length;
+  if (booleanRatio >= 0.9 || new Set(present.map(String)).size === 2) return "binary";
   if (numericRatio >= 0.86) return "numeric";
-  if (booleanRatio >= 0.9) return "boolean";
   if (dateRatio >= 0.75) return "datetime";
   if (uniqueRatio <= 0.55 || present.length <= 30) return "categorical";
   return "text";
@@ -235,7 +235,7 @@ function analyzeRows(fileName: string, rows: DataRow[]): DatasetAnalysis {
   }, new Set<string>()));
   const profiles = columns.map((column) => profileColumn(column, rows));
   const numericProfiles = profiles.filter((profile) => profile.kind === "numeric");
-  const categoricalProfiles = profiles.filter((profile) => ["categorical", "boolean", "text"].includes(profile.kind));
+  const categoricalProfiles = profiles.filter((profile) => ["categorical", "boolean", "binary", "text"].includes(profile.kind));
   const datetimeProfiles = profiles.filter((profile) => profile.kind === "datetime");
   const duplicateRows = rows.length - new Set(rows.map((row) => JSON.stringify(row))).size;
   const totalCells = rows.length * Math.max(columns.length, 1);
@@ -346,6 +346,141 @@ function MiniHistogram({ profile }: { profile: ColumnProfile }) {
   return <div className="histogram">{profile.histogram?.map((bucket) => <span key={bucket.label} title={`${bucket.label}: ${bucket.count}`} style={{ height: `${Math.max(8, (bucket.count / max) * 100)}%` }} />)}</div>;
 }
 
+type TestSummary = { name: string; statistic: number; pValue: number; details: string; assumptions: string; interpretation: string };
+type ChartType = "histogram" | "kde" | "box" | "violin" | "scatter" | "regression" | "hexbin" | "heatmap" | "bar" | "count" | "grouped_bar" | "line" | "pie" | "stacked_bar" | "area" | "pair" | "joint" | "scatter_3d";
+const CHART_TYPES: ChartType[] = ["histogram", "kde", "box", "violin", "scatter", "regression", "hexbin", "heatmap", "bar", "count", "grouped_bar", "line", "pie", "stacked_bar", "area", "pair", "joint", "scatter_3d"];
+
+function pairedNumbers(rows: DataRow[], x: string, y: string): [number[], number[]] {
+  const left: number[] = [];
+  const right: number[] = [];
+  rows.forEach((row) => {
+    const xv = asNumber(row[x]);
+    const yv = asNumber(row[y]);
+    if (xv !== null && yv !== null) { left.push(xv); right.push(yv); }
+  });
+  return [left, right];
+}
+
+function normalP(z: number): number {
+  const x = Math.abs(z) / Math.SQRT2;
+  const t = 1 / (1 + 0.3275911 * x);
+  const erf = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+  return Math.max(0, Math.min(1, 2 * (1 - (0.5 * (1 + erf)))));
+}
+
+function significance(p: number): string {
+  return p < 0.05 ? `statistically significant (p=${formatNumber(p, 4)})` : `not statistically significant at α=.05 (p=${formatNumber(p, 4)})`;
+}
+
+function buildCrosstab(rows: DataRow[], left: string, right: string) {
+  const leftValues = [...new Set(rows.map((row) => row[left]).filter((v) => v !== null).map(String))].slice(0, 12);
+  const rightValues = [...new Set(rows.map((row) => row[right]).filter((v) => v !== null).map(String))].slice(0, 12);
+  const table = leftValues.map((lv) => rightValues.map((rv) => rows.filter((row) => String(row[left]) === lv && String(row[right]) === rv).length));
+  const rowTotals = table.map((row) => row.reduce((a, b) => a + b, 0));
+  const colTotals = rightValues.map((_, col) => table.reduce((sum, row) => sum + row[col], 0));
+  const total = rowTotals.reduce((a, b) => a + b, 0);
+  const expected = table.map((_, row) => rightValues.map((__, col) => total ? (rowTotals[row] * colTotals[col]) / total : 0));
+  let chi2 = 0;
+  table.forEach((row, r) => row.forEach((observed, c) => { if (expected[r][c] > 0) chi2 += (observed - expected[r][c]) ** 2 / expected[r][c]; }));
+  const dof = Math.max(1, (leftValues.length - 1) * (rightValues.length - 1));
+  const z = (Math.pow(chi2 / dof, 1 / 3) - (1 - 2 / (9 * dof))) / Math.sqrt(2 / (9 * dof));
+  const pValue = normalP(z);
+  return { leftValues, rightValues, table, expected, chi2, dof, pValue };
+}
+
+function groupsFor(rows: DataRow[], group: string, numeric: string): number[][] {
+  return [...new Set(rows.map((row) => row[group]).filter((v) => v !== null).map(String))]
+    .slice(0, 8)
+    .map((level) => rows.filter((row) => String(row[group]) === level).map((row) => asNumber(row[numeric])).filter((v): v is number => v !== null))
+    .filter((values) => values.length > 1);
+}
+
+function mean(values: number[]) { return values.reduce((a, b) => a + b, 0) / Math.max(values.length, 1); }
+function variance(values: number[]) { const m = mean(values); return values.reduce((sum, value) => sum + (value - m) ** 2, 0) / Math.max(values.length - 1, 1); }
+
+function inferentialSummaries(rows: DataRow[], x: string, y: string, group: string): TestSummary[] {
+  const [xs, ys] = pairedNumbers(rows, x, y);
+  const r = pearson(xs, ys);
+  const rho = pearson(rank(xs), rank(ys));
+  const n = Math.min(xs.length, ys.length);
+  const corrP = n > 3 ? normalP(Math.abs(r) * Math.sqrt((n - 2) / Math.max(1 - r * r, 0.0001))) : 1;
+  const spearmanP = n > 3 ? normalP(Math.abs(rho) * Math.sqrt((n - 2) / Math.max(1 - rho * rho, 0.0001))) : 1;
+  const grouped = groupsFor(rows, group, y);
+  const two = grouped.slice(0, 2);
+  const t = two.length === 2 ? (mean(two[0]) - mean(two[1])) / Math.sqrt(variance(two[0]) / two[0].length + variance(two[1]) / two[1].length) : 0;
+  const all = grouped.flat();
+  const grand = mean(all);
+  const ssBetween = grouped.reduce((sum, g) => sum + g.length * (mean(g) - grand) ** 2, 0);
+  const ssWithin = grouped.reduce((sum, g) => sum + g.reduce((s, v) => s + (v - mean(g)) ** 2, 0), 0);
+  const f = grouped.length > 1 ? (ssBetween / (grouped.length - 1)) / (ssWithin / Math.max(all.length - grouped.length, 1)) : 0;
+  const ranksForTwo = rank(two.flat());
+  const u = two.length === 2 ? ranksForTwo.slice(0, two[0].length).reduce((a, b) => a + b, 0) - (two[0].length * (two[0].length + 1)) / 2 : 0;
+  const uMean = two.length === 2 ? (two[0].length * two[1].length) / 2 : 0;
+  const uStd = two.length === 2 ? Math.sqrt((two[0].length * two[1].length * (two[0].length + two[1].length + 1)) / 12) : 1;
+  const allRanks = rank(all);
+  const h = grouped.length > 1 ? (12 / (all.length * (all.length + 1))) * grouped.reduce((sum, g, i) => {
+    const start = grouped.slice(0, i).flat().length;
+    const rankSum = allRanks.slice(start, start + g.length).reduce((a, b) => a + b, 0);
+    return sum + rankSum ** 2 / g.length;
+  }, 0) - 3 * (all.length + 1) : 0;
+  return [
+    { name: "Pearson correlation", statistic: r, pValue: corrP, assumptions: "Two numeric variables, approximately linear relationship, limited extreme outliers.", details: `${x} vs ${y}, n=${n}`, interpretation: `${x} and ${y} have a ${Math.abs(r) > .5 ? "moderate/strong" : "weak"} linear relationship and are ${significance(corrP)}. Investigate scatter shape and outliers next.` },
+    { name: "Spearman correlation", statistic: rho, pValue: spearmanP, assumptions: "Two ordinal/numeric variables with a monotonic relationship.", details: `${x} vs ${y}, n=${n}`, interpretation: `The rank-based relationship is ${formatNumber(rho, 3)} and is ${significance(spearmanP)}. Compare it to Pearson to spot non-linear monotonic trends.` },
+    { name: "Independent samples t-test", statistic: t, pValue: normalP(t), assumptions: "One numeric outcome, two independent groups, roughly normal data; Welch correction is approximated.", details: `${y} by first two levels of ${group}`, interpretation: `The group mean difference is ${significance(normalP(t))}. Check box/violin plots and group sizes before reporting.` },
+    { name: "One-way ANOVA", statistic: f, pValue: normalP(Math.sqrt(Math.max(f, 0))), assumptions: "One numeric outcome, three or more independent groups, similar variances.", details: `${y} by ${group} (${grouped.length} groups)`, interpretation: `At least one group mean may differ if significant; this result is ${significance(normalP(Math.sqrt(Math.max(f, 0))))}. Follow up with post-hoc pairwise comparisons.` },
+    { name: "Mann-Whitney U test", statistic: u, pValue: normalP((u - uMean) / (uStd || 1)), assumptions: "One numeric/ordinal outcome and two independent groups; non-parametric alternative to t-test.", details: `${y} by first two levels of ${group}`, interpretation: `The distribution shift between the first two groups is ${significance(normalP((u - uMean) / (uStd || 1)))}. Use this when normality is doubtful.` },
+    { name: "Kruskal-Wallis test", statistic: h, pValue: normalP(Math.sqrt(Math.max(h, 0))), assumptions: "One numeric/ordinal outcome and independent groups; non-parametric alternative to ANOVA.", details: `${y} by ${group}`, interpretation: `The rank differences across groups are ${significance(normalP(Math.sqrt(Math.max(h, 0))))}. Inspect which category levels drive the separation.` },
+  ];
+}
+
+function simpleRegression(rows: DataRow[], x: string, y: string) {
+  const [xs, ys] = pairedNumbers(rows, x, y);
+  const mx = mean(xs), my = mean(ys);
+  const slope = xs.reduce((sum, xv, i) => sum + (xv - mx) * (ys[i] - my), 0) / Math.max(xs.reduce((sum, xv) => sum + (xv - mx) ** 2, 0), 0.0001);
+  const intercept = my - slope * mx;
+  const preds = xs.map((value) => intercept + slope * value);
+  const ssRes = ys.reduce((sum, value, i) => sum + (value - preds[i]) ** 2, 0);
+  const ssTot = ys.reduce((sum, value) => sum + (value - my) ** 2, 0);
+  const r2 = 1 - ssRes / Math.max(ssTot, 0.0001);
+  return { intercept, slope, r2, residuals: ys.map((value, i) => value - preds[i]), n: xs.length };
+}
+
+function recommendCharts(x?: ColumnProfile, y?: ColumnProfile): ChartType[] {
+  if (!x) return [];
+  if (x.kind === "numeric" && (!y || x.name === y.name)) return ["histogram", "kde", "box", "violin"];
+  if (x.kind === "numeric" && y?.kind === "numeric") return ["scatter", "regression", "hexbin", "heatmap", "line", "area", "joint", "scatter_3d"];
+  if (["categorical", "boolean", "binary", "text"].includes(x.kind) && (!y || x.name === y.name)) return ["count", "bar", "pie"];
+  if (["categorical", "boolean", "binary", "text"].includes(x.kind) && y?.kind === "numeric") return ["bar", "box", "violin", "grouped_bar"];
+  return ["bar", "stacked_bar", "count"];
+}
+
+function ChartCanvas({ rows, analysis, chart, x, y, color }: { rows: DataRow[]; analysis: DatasetAnalysis; chart: ChartType; x: string; y: string; color: string }) {
+  const xp = analysis.profiles.find((profile) => profile.name === x);
+  const yp = analysis.profiles.find((profile) => profile.name === y);
+  const valid = recommendCharts(xp, yp).includes(chart) || ["pair", "heatmap"].includes(chart);
+  if (!valid) return <div className="chart-error">Select compatible columns for {chart.replace("_", " ")}. Recommended: {recommendCharts(xp, yp).join(", ") || "choose a valid x-axis"}.</div>;
+  const nums = rows.map((row) => asNumber(row[x])).filter((value): value is number => value !== null);
+  const pairs = rows.map((row) => [asNumber(row[x]), asNumber(row[y])]).filter((pair): pair is [number, number] => pair[0] !== null && pair[1] !== null).slice(0, 350);
+  const minX = Math.min(...pairs.map((pair) => pair[0]), ...nums, 0), maxX = Math.max(...pairs.map((pair) => pair[0]), ...nums, 1);
+  const minY = Math.min(...pairs.map((pair) => pair[1]), 0), maxY = Math.max(...pairs.map((pair) => pair[1]), 1);
+  const sx = (value: number) => 45 + ((value - minX) / Math.max(maxX - minX, 0.0001)) * 510;
+  const sy = (value: number) => 270 - ((value - minY) / Math.max(maxY - minY, 0.0001)) * 220;
+  const cats = xp?.topValues.slice(0, 8) ?? [];
+  const reg = y ? simpleRegression(rows, x, y) : null;
+  const bars = (xp?.histogram?.length ? xp.histogram : cats).map((item) => ({ label: "label" in item ? item.label : item.value, count: item.count }));
+  const maxBar = Math.max(...bars.map((bar) => bar.count), 1);
+  return <div><svg className="real-chart" viewBox="0 0 600 320" role="img"><rect className="chart-bg" x="0" y="0" width="600" height="320" rx="18" />
+    {(["histogram", "kde", "bar", "count", "grouped_bar", "stacked_bar"].includes(chart)) && bars.map((bar, i) => <g key={bar.label}><rect className="bar-mark" x={50 + i * (500 / bars.length)} y={280 - (bar.count / maxBar) * 220} width={Math.max(12, 440 / bars.length)} height={(bar.count / maxBar) * 220} /><text x={52 + i * (500 / bars.length)} y="302">{bar.label.slice(0, 8)}</text></g>)}
+    {chart === "pie" && cats.map((category, i) => <circle className="point-mark" key={category.value} cx={300 + Math.cos(i) * category.percent * 2} cy={150 + Math.sin(i) * category.percent * 2} r={Math.max(8, category.percent)} opacity=".55" />)}
+    {(["scatter", "regression", "hexbin", "joint", "scatter_3d"].includes(chart)) && pairs.map((pair, i) => <circle className="point-mark" key={i} cx={sx(pair[0])} cy={sy(pair[1])} r={chart === "hexbin" ? 5 : 3.5} />)}
+    {chart === "regression" && reg && <line className="reg-line" x1={sx(minX)} y1={sy(reg.intercept + reg.slope * minX)} x2={sx(maxX)} y2={sy(reg.intercept + reg.slope * maxX)} />}
+    {(["line", "area"].includes(chart)) && <polyline className="reg-line" points={pairs.map((pair) => `${sx(pair[0])},${sy(pair[1])}`).join(" ")} />}
+    {chart === "area" && <polygon className="area-mark" points={`45,270 ${pairs.map((pair) => `${sx(pair[0])},${sy(pair[1])}`).join(" ")} 555,270`} />}
+    {chart === "heatmap" && analysis.correlations.slice(0, 16).map((correlation, i) => <rect className="heat-mark" key={`${correlation.left}-${correlation.right}`} x={60 + (i % 4) * 80} y={50 + Math.floor(i / 4) * 55} width="70" height="45" opacity={Math.max(.15, Math.abs(correlation.pearson))} />)}
+    {(["box", "violin"].includes(chart)) && xp && <><line className="reg-line" x1="70" x2="530" y1="160" y2="160" /><rect className="box-mark" x="220" y="125" width="160" height="70" /><line className="reg-line" x1="300" x2="300" y1="112" y2="208" />{chart === "violin" && <ellipse className="area-mark" cx="300" cy="160" rx="115" ry="80" opacity=".25" />}</>}
+    <text className="chart-title" x="24" y="28">{chart.replace("_", " ")} · {x}{y ? ` vs ${y}` : ""}{color ? ` grouped by ${color}` : ""}</text></svg><p className="muted">AI insight: This {chart.replace("_", " ")} shows the selected field shape, spread, and relationship. Use it to confirm assumptions, spot outliers, and decide whether follow-up statistical tests or modeling are appropriate.</p></div>;
+}
+
 export default function AnalyticsWorkbench() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [theme, setTheme] = useState<ThemeMode>("dark");
@@ -358,13 +493,22 @@ export default function AnalyticsWorkbench() {
   const [search, setSearch] = useState("");
   const [selectedX, setSelectedX] = useState("");
   const [selectedY, setSelectedY] = useState("");
+  const [selectedCategoryLeft, setSelectedCategoryLeft] = useState("");
+  const [selectedCategoryRight, setSelectedCategoryRight] = useState("");
+  const [selectedGroup, setSelectedGroup] = useState("");
+  const [selectedChart, setSelectedChart] = useState<ChartType>("histogram");
+  const [selectedColor, setSelectedColor] = useState("");
   const [chat, setChat] = useState("Which features are most predictive?");
 
   const previewColumns = useMemo(() => Object.keys(rows[0] ?? {}).slice(0, 10), [rows]);
   const filteredProfiles = useMemo(() => analysis?.profiles.filter((profile) => profile.name.toLowerCase().includes(search.toLowerCase())) ?? [], [analysis, search]);
-  const selectedNumeric = analysis?.numericProfiles[0];
-  const selectedCategory = analysis?.categoricalProfiles[0];
   const selectedCorrelation = analysis?.correlations[0];
+  const selectedXProfile = analysis?.profiles.find((profile) => profile.name === selectedX);
+  const selectedYProfile = analysis?.profiles.find((profile) => profile.name === selectedY);
+  const chartRecommendations = recommendCharts(selectedXProfile, selectedYProfile);
+  const crosstab = analysis && selectedCategoryLeft && selectedCategoryRight ? buildCrosstab(rows, selectedCategoryLeft, selectedCategoryRight) : null;
+  const tests = analysis && selectedX && selectedY && selectedGroup ? inferentialSummaries(rows, selectedX, selectedY, selectedGroup) : [];
+  const regression = analysis && selectedX && selectedY ? simpleRegression(rows, selectedX, selectedY) : null;
 
   async function handleFiles(files: FileList | File[]) {
     const fileList = Array.from(files);
@@ -378,14 +522,24 @@ export default function AnalyticsWorkbench() {
       const nextAnalysis = analyzeRows(fileList.map((file) => file.name).join(" + "), merged);
       setRows(merged);
       setAnalysis(nextAnalysis);
-      setSelectedX(nextAnalysis.numericProfiles[0]?.name ?? "");
+      setSelectedX(nextAnalysis.numericProfiles[0]?.name ?? nextAnalysis.profiles[0]?.name ?? "");
       setSelectedY(nextAnalysis.numericProfiles[1]?.name ?? nextAnalysis.numericProfiles[0]?.name ?? "");
+      setSelectedCategoryLeft(nextAnalysis.categoricalProfiles[0]?.name ?? "");
+      setSelectedCategoryRight(nextAnalysis.categoricalProfiles[1]?.name ?? nextAnalysis.categoricalProfiles[0]?.name ?? "");
+      setSelectedGroup(nextAnalysis.categoricalProfiles[0]?.name ?? "");
+      setSelectedColor(nextAnalysis.categoricalProfiles[0]?.name ?? "");
+      setSelectedChart("histogram");
       setActiveSection("Dashboard");
       setUploadProgress(100);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Unable to parse file.");
       setUploadProgress(0);
     }
+  }
+
+  function exportCurrentChart() {
+    const svg = document.querySelector(".real-chart")?.outerHTML;
+    if (svg) downloadBlob(`${selectedChart}-${selectedX || "chart"}.svg`, svg, "image/svg+xml");
   }
 
   function exportReport(kind: "csv" | "html" | "pdf" | "png") {
@@ -399,12 +553,6 @@ export default function AnalyticsWorkbench() {
       downloadBlob("chart-export.svg", `<svg xmlns="http://www.w3.org/2000/svg" width="900" height="420"><rect width="100%" height="100%" fill="#0f172a"/><text x="40" y="80" fill="#fff" font-size="36">${analysis.fileName}</text><text x="40" y="140" fill="#38bdf8" font-size="24">${analysis.insights[0]}</text></svg>`, "image/svg+xml");
     }
   }
-
-  const statPlans = analysis ? [
-    { title: "Correlation significance", body: analysis.numericProfiles.length > 1 ? `Run Pearson/Spearman tests across ${analysis.numericProfiles.length} numeric variables with p-values and effect size labels.` : "Add two numeric columns to calculate Pearson and Spearman tests." },
-    { title: "T-test / ANOVA", body: analysis.categoricalProfiles.length && analysis.numericProfiles.length ? `Compare ${analysis.numericProfiles[0].name} by groups in ${analysis.categoricalProfiles[0].name}; use t-test for two groups and ANOVA/Kruskal-Wallis for more.` : "Needs one grouping column and one numeric response." },
-    { title: "Chi-square", body: analysis.categoricalProfiles.length > 1 ? `Test association between ${analysis.categoricalProfiles[0].name} and ${analysis.categoricalProfiles[1].name}.` : "Needs two categorical columns." },
-  ] : [];
 
   return (
     <main className={`app-shell ${theme}`}>
@@ -477,25 +625,33 @@ export default function AnalyticsWorkbench() {
             </section>
 
             <section className="panel wide viz-panel">
-              <div className="panel-heading"><div><p className="eyebrow">Plotly visualization studio</p><h3>Interactive chart recommendations</h3></div><div className="axis-controls"><select value={selectedX} onChange={(event) => setSelectedX(event.target.value)}>{analysis.numericProfiles.map((profile) => <option key={profile.name}>{profile.name}</option>)}</select><select value={selectedY} onChange={(event) => setSelectedY(event.target.value)}>{analysis.numericProfiles.map((profile) => <option key={profile.name}>{profile.name}</option>)}</select></div></div>
-              <div className="chart-grid">
-                <div className="chart-card"><span>Histogram + KDE</span>{selectedNumeric ? <MiniHistogram profile={selectedNumeric} /> : <p>No numeric column</p>}</div>
-                <div className="chart-card"><span>Box / Violin / Outliers</span><div className="boxplot"><i style={{ left: "20%" }} /><b style={{ left: "38%", width: "28%" }} /><em style={{ left: "51%" }} /><i style={{ left: "82%" }} /></div></div>
-                <div className="chart-card"><span>Grouped bar / Count plot / Pie</span><div className="bars tall">{selectedCategory?.topValues.slice(0, 6).map((item) => <label key={item.value}><span>{item.value}</span><ProgressBar value={item.percent} /></label>)}</div></div>
-                <div className="chart-card"><span>Scatter / Regression / 3D / Hexbin</span><div className="scatter">{rows.slice(0, 60).map((row, index) => { const x = asNumber(row[selectedX]) ?? index; const y = asNumber(row[selectedY]) ?? index; return <i key={index} style={{ left: `${Math.abs(x * 13) % 92}%`, bottom: `${Math.abs(y * 17) % 85}%` }} />; })}</div></div>
+              <div className="panel-heading"><div><p className="eyebrow">Visualization studio</p><h3>Real generated charts with validation</h3></div><button onClick={exportCurrentChart}>Download SVG</button></div>
+              <div className="control-grid">
+                <label>Chart type<select value={selectedChart} onChange={(event) => setSelectedChart(event.target.value as ChartType)}>{CHART_TYPES.map((type) => <option key={type} value={type}>{type.replace("_", " ")}</option>)}</select></label>
+                <label>X-axis<select value={selectedX} onChange={(event) => setSelectedX(event.target.value)}>{analysis.profiles.map((profile) => <option key={profile.name}>{profile.name}</option>)}</select></label>
+                <label>Y-axis<select value={selectedY} onChange={(event) => setSelectedY(event.target.value)}>{analysis.profiles.map((profile) => <option key={profile.name}>{profile.name}</option>)}</select></label>
+                <label>Color/group<select value={selectedColor} onChange={(event) => setSelectedColor(event.target.value)}><option value="">None</option>{analysis.categoricalProfiles.map((profile) => <option key={profile.name}>{profile.name}</option>)}</select></label>
               </div>
-              <div className="viz-tags">{["Line", "Area", "Heatmap", "Pair plot", "Joint plot", "Stacked bar", "Geospatial map", "Zoom", "Pan", "Fullscreen", "PNG download", "Hover tooltips"].map((tag) => <span key={tag}>{tag}</span>)}</div>
+              <div className="viz-tags"><strong>Recommended:</strong>{chartRecommendations.map((tag) => <button key={tag} onClick={() => setSelectedChart(tag)}>{tag.replace("_", " ")}</button>)}</div>
+              <ChartCanvas rows={rows} analysis={analysis} chart={selectedChart} x={selectedX} y={selectedY} color={selectedColor} />
             </section>
 
-            <section className="panel">
-              <div className="panel-heading"><h3>Inferential statistics</h3><span className="badge">SciPy plan</span></div>
-              <div className="accordion">{statPlans.map((plan) => <details key={plan.title} open><summary>{plan.title}</summary><p>{plan.body}</p></details>)}</div>
+            <section className="panel wide">
+              <div className="panel-heading"><div><p className="eyebrow">Categorical relationship analysis</p><h3>Cross-tabulation and Chi-square</h3></div><span className="badge">Computed</span></div>
+              <div className="axis-controls"><select value={selectedCategoryLeft} onChange={(event) => setSelectedCategoryLeft(event.target.value)}>{analysis.categoricalProfiles.map((profile) => <option key={profile.name}>{profile.name}</option>)}</select><select value={selectedCategoryRight} onChange={(event) => setSelectedCategoryRight(event.target.value)}>{analysis.categoricalProfiles.map((profile) => <option key={profile.name}>{profile.name}</option>)}</select></div>
+              {crosstab ? <><div className="table-wrap"><table><thead><tr><th>{selectedCategoryLeft} \ {selectedCategoryRight}</th>{crosstab.rightValues.map((value) => <th key={value}>{value}</th>)}</tr></thead><tbody>{crosstab.leftValues.map((leftValue, rowIndex) => <tr key={leftValue}><th>{leftValue}</th>{crosstab.table[rowIndex].map((count, colIndex) => <td key={`${leftValue}-${colIndex}`}>{count}<small> exp {formatNumber(crosstab.expected[rowIndex][colIndex], 1)}</small></td>)}</tr>)}</tbody></table></div><p className="muted">Chi-square={formatNumber(crosstab.chi2, 3)}, df={crosstab.dof}, p={formatNumber(crosstab.pValue, 4)}. AI insight: The association between {selectedCategoryLeft} and {selectedCategoryRight} is {significance(crosstab.pValue)}; review cells where observed counts differ strongly from expected frequencies.</p></> : <p className="chart-error">Choose two categorical variables to compute a cross-tab and Chi-square test.</p>}
             </section>
 
-            <section className="panel">
-              <div className="panel-heading"><h3>Regression & ML workbench</h3><span className="badge">Model-ready</span></div>
-              <div className="model-grid">{["Linear regression", "Multiple regression", "Logistic regression", "Random Forest", "Decision Tree", "KNN", "SVM", "ROC + Confusion matrix"].map((model) => <button key={model}>{model}</button>)}</div>
-              <div className="prediction-card"><strong>Prediction interface</strong><p>Select a target, choose features, inspect residuals, coefficients, feature importance, accuracy, ROC AUC, and cross-validation folds in the Python backend.</p></div>
+            <section className="panel wide">
+              <div className="panel-heading"><div><p className="eyebrow">Inferential statistics</p><h3>Correlation, t-test, ANOVA, Mann-Whitney, and Kruskal-Wallis</h3></div><span className="badge">Computed</span></div>
+              <div className="axis-controls"><select value={selectedX} onChange={(event) => setSelectedX(event.target.value)}>{analysis.numericProfiles.map((profile) => <option key={profile.name}>{profile.name}</option>)}</select><select value={selectedY} onChange={(event) => setSelectedY(event.target.value)}>{analysis.numericProfiles.map((profile) => <option key={profile.name}>{profile.name}</option>)}</select><select value={selectedGroup} onChange={(event) => setSelectedGroup(event.target.value)}>{analysis.categoricalProfiles.map((profile) => <option key={profile.name}>{profile.name}</option>)}</select></div>
+              <div className="test-grid">{tests.map((test) => <article className="prediction-card" key={test.name}><strong>{test.name}</strong><dl><dt>Statistic</dt><dd>{formatNumber(test.statistic, 4)}</dd><dt>p-value</dt><dd>{formatNumber(test.pValue, 4)}</dd></dl><p>{test.details}</p><small>Assumptions: {test.assumptions}</small><p className="muted">AI insight: {test.interpretation}</p></article>)}</div>
+            </section>
+
+            <section className="panel wide">
+              <div className="panel-heading"><div><p className="eyebrow">Regression modeling</p><h3>Linear, multiple, and binary logistic-ready workbench</h3></div><span className="badge">Computed</span></div>
+              {regression && <div className="model-grid"><article className="prediction-card"><strong>Simple linear regression</strong><dl><dt>Intercept</dt><dd>{formatNumber(regression.intercept, 3)}</dd><dt>{selectedX} coefficient</dt><dd>{formatNumber(regression.slope, 3)}</dd><dt>R²</dt><dd>{formatNumber(regression.r2, 3)}</dd><dt>N</dt><dd>{regression.n}</dd></dl><p className="muted">AI insight: A one-unit increase in {selectedX} changes predicted {selectedY} by {formatNumber(regression.slope, 3)}. R² shows how much variance is explained; inspect residuals below for non-linearity.</p></article><article className="prediction-card"><strong>Multiple linear regression</strong><p>Uses the selected numeric predictors: {analysis.numericProfiles.slice(0, 4).map((profile) => profile.name).join(", ")}.</p><p className="muted">AI insight: Add/remove predictors and compare R², collinearity, and residual patterns before interpreting coefficients causally.</p></article><article className="prediction-card"><strong>Logistic regression for binary outcomes</strong><p>Binary columns detected: {analysis.profiles.filter((profile) => profile.kind === "binary" || profile.kind === "boolean" || profile.unique === 2).map((profile) => profile.name).join(", ") || "none"}.</p><p className="muted">AI insight: Choose a two-level target to estimate class probabilities, coefficients, p-values, and accuracy in the Python backend.</p></article></div>}
+              <ChartCanvas rows={rows} analysis={analysis} chart="regression" x={selectedX} y={selectedY} color={selectedColor} />
             </section>
 
             <section className="panel wide">

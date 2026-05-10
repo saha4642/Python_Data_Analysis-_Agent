@@ -35,6 +35,40 @@ requirements.txt           # Python analytics dependencies
 README.md                  # Documentation and deployment guide
 ```
 
+
+## Running the full analysis app
+
+Run the Python analytics API and the Next.js UI in two terminals so uploads can be profiled, tested, modeled, visualized, and exported end-to-end.
+
+### Terminal 1: analytics backend
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+npm run backend
+```
+
+The backend uses Pandas, NumPy, SciPy, Statsmodels, Scikit-learn, and Plotly to compute column-type detection, descriptive statistics, frequency tables, Chi-square tests, Pearson/Spearman correlations, t-tests, ANOVA, Mann-Whitney U, Kruskal-Wallis, linear/logistic modeling metrics, residual plots, and Plotly chart payloads.
+
+### Terminal 2: Next.js frontend
+
+```bash
+npm install
+NEXT_PUBLIC_ANALYTICS_API_URL=http://localhost:8000 npm run dev
+```
+
+Open <http://localhost:3000>, upload a CSV/XLSX/JSON file, and use the dashboard controls to select x-axis, y-axis, grouping column, chart type, categorical variables, and model variables. Every analysis panel now produces computed output from the uploaded rows instead of a static roadmap.
+
+### Student performance smoke test
+
+Use `student-mat.csv` from the UCI Student Performance dataset. After upload, verify:
+
+- `age`, `Medu`, and `Fedu` are detected as numeric fields with mean, median, mode, standard deviation, variance, range, IQR, min, max, skewness, kurtosis, histograms, and regression/correlation options.
+- `school`, `sex`, and `address` are detected as categorical/binary fields with frequency counts, percentages, count/bar/pie charts, cross-tabulation, expected frequencies, and Chi-square interpretation.
+- Select `age` as x-axis, `Medu` or `Fedu` as y-axis, and `sex` or `address` as the group to generate Pearson, Spearman, t-test, ANOVA, Mann-Whitney U, Kruskal-Wallis, scatter/regression charts, grouped bars, and residual plots.
+- Use **Download SVG** or the report export buttons to save generated visualizations and analysis summaries.
+
 ## Local development
 
 ### 1. Frontend
