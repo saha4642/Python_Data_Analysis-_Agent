@@ -1,6 +1,7 @@
 "use client";
 
-import { ChangeEvent, DragEvent, useMemo, useRef, useState } from "react";
+import type { CSSProperties, ChangeEvent, DragEvent } from "react";
+import { useMemo, useRef, useState } from "react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
 
@@ -21,6 +22,7 @@ type ColumnProfile = {
   stdev?: number;
   q1?: number;
   q3?: number;
+  histogram?: Array<{ start: number; end: number; count: number; percent: number }>;
   topValues: Array<{ value: string; count: number; percent: number }>;
 };
 
@@ -76,6 +78,33 @@ function formatNumber(value?: number, digits = 2): string {
   return new Intl.NumberFormat("en", { maximumFractionDigits: digits }).format(value);
 }
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+function buildHistogram(sorted: number[], bucketCount = 8): ColumnProfile["histogram"] {
+  if (!sorted.length) return [];
+  const min = sorted[0];
+  const max = sorted[sorted.length - 1];
+
+  if (min === max) {
+    return [{ start: min, end: max, count: sorted.length, percent: 100 }];
+  }
+
+  const buckets = Array.from({ length: bucketCount }, (_, index) => {
+    const start = min + ((max - min) / bucketCount) * index;
+    const end = index === bucketCount - 1 ? max : min + ((max - min) / bucketCount) * (index + 1);
+    return { start, end, count: 0, percent: 0 };
+  });
+
+  sorted.forEach((value) => {
+    const bucketIndex = clamp(Math.floor(((value - min) / (max - min)) * bucketCount), 0, bucketCount - 1);
+    buckets[bucketIndex].count += 1;
+  });
+
+  return buckets.map((bucket) => ({ ...bucket, percent: (bucket.count / sorted.length) * 100 }));
+}
+
 function inferKind(values: Array<string | number | boolean | null>): ColumnKind {
   const present = values.filter((value) => value !== null);
   if (!present.length) return "text";
@@ -129,6 +158,7 @@ function profileColumn(name: string, rows: DataRow[]): ColumnProfile {
       q1: quantile(nums, 0.25),
       q3: quantile(nums, 0.75),
       stdev: Math.sqrt(variance),
+      histogram: buildHistogram(nums),
     };
   }
 
@@ -360,6 +390,160 @@ function TopValues({ profiles }: { profiles: ColumnProfile[] }) {
   );
 }
 
+
+function DonutGauge({ value, label }: { value: number; label: string }) {
+  const safeValue = clamp(value, 0, 100);
+
+  return (
+    <article className="viz-card donut-card">
+      <div className="donut" style={{ "--value": `${safeValue}%` } as CSSProperties} aria-label={`${label}: ${formatNumber(safeValue)}%`}>
+        <strong>{formatNumber(safeValue, 0)}%</strong>
+        <span>{label}</span>
+      </div>
+      <p>Quick read on whether the dataset is complete enough for reliable analysis.</p>
+    </article>
+  );
+}
+
+function TypeMixChart({ profiles }: { profiles: ColumnProfile[] }) {
+  const typeCounts = profiles.reduce<Record<ColumnKind, number>>((counts, profile) => {
+    counts[profile.kind] += 1;
+    return counts;
+  }, { numeric: 0, date: 0, boolean: 0, text: 0 });
+  const total = Math.max(profiles.length, 1);
+  const segments = (Object.entries(typeCounts) as Array<[ColumnKind, number]>).filter(([, count]) => count > 0);
+
+  return (
+    <article className="viz-card">
+      <div className="viz-card-heading">
+        <h3>Column type mix</h3>
+        <span>{profiles.length} fields</span>
+      </div>
+      <div className="stacked-bar" aria-label="Column type distribution">
+        {segments.map(([kind, count]) => (
+          <span className={kind} key={kind} style={{ width: `${(count / total) * 100}%` }} title={`${kind}: ${count}`} />
+        ))}
+      </div>
+      <div className="legend-grid">
+        {segments.map(([kind, count]) => (
+          <span key={kind}><i className={kind} />{kind}: {count}</span>
+        ))}
+      </div>
+    </article>
+  );
+}
+
+function MissingnessChart({ profiles }: { profiles: ColumnProfile[] }) {
+  const ranked = [...profiles]
+    .map((profile) => ({ ...profile, missingPercent: (profile.missing / Math.max(profile.total, 1)) * 100 }))
+    .sort((a, b) => b.missingPercent - a.missingPercent)
+    .slice(0, 8);
+
+  return (
+    <article className="viz-card wide-viz-card">
+      <div className="viz-card-heading">
+        <h3>Missing data hotspots</h3>
+        <span>Top {ranked.length}</span>
+      </div>
+      <div className="missing-chart">
+        {ranked.map((profile) => (
+          <div className="missing-row" key={profile.name}>
+            <span>{profile.name}</span>
+            <div className="missing-track"><i style={{ width: `${Math.max(profile.missingPercent, profile.missingPercent > 0 ? 3 : 0)}%` }} /></div>
+            <strong>{formatNumber(profile.missingPercent, 1)}%</strong>
+          </div>
+        ))}
+      </div>
+    </article>
+  );
+}
+
+function DistributionCharts({ profiles }: { profiles: ColumnProfile[] }) {
+  const chartProfiles = profiles.filter((profile) => profile.histogram?.length).slice(0, 4);
+  if (!chartProfiles.length) return null;
+
+  return (
+    <article className="viz-card wide-viz-card">
+      <div className="viz-card-heading">
+        <h3>Numeric distributions</h3>
+        <span>Histograms</span>
+      </div>
+      <div className="histogram-grid">
+        {chartProfiles.map((profile) => {
+          const maxCount = Math.max(...(profile.histogram ?? []).map((bucket) => bucket.count), 1);
+          return (
+            <div className="histogram-card" key={profile.name}>
+              <div className="histogram-title">
+                <strong>{profile.name}</strong>
+                <span>{formatNumber(profile.min)} → {formatNumber(profile.max)}</span>
+              </div>
+              <div className="histogram-bars" aria-label={`${profile.name} distribution histogram`}>
+                {profile.histogram?.map((bucket) => (
+                  <span
+                    key={`${bucket.start}-${bucket.end}`}
+                    style={{ height: `${Math.max((bucket.count / maxCount) * 100, bucket.count ? 8 : 2)}%` }}
+                    title={`${formatNumber(bucket.start)} to ${formatNumber(bucket.end)}: ${bucket.count}`}
+                  />
+                ))}
+              </div>
+              <div className="boxplot" aria-label={`${profile.name} box plot`}>
+                <span className="whisker" style={{ left: "0%", width: "100%" }} />
+                <span className="box" style={{ left: `${percentAlong(profile.q1, profile.min, profile.max)}%`, width: `${Math.max(percentAlong(profile.q3, profile.min, profile.max) - percentAlong(profile.q1, profile.min, profile.max), 2)}%` }} />
+                <span className="median" style={{ left: `${percentAlong(profile.median, profile.min, profile.max)}%` }} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </article>
+  );
+}
+
+function percentAlong(value?: number, min?: number, max?: number): number {
+  if (value === undefined || min === undefined || max === undefined || min === max) return 0;
+  return clamp(((value - min) / (max - min)) * 100, 0, 100);
+}
+
+function CorrelationHeatmap({ correlations }: { correlations: DatasetAnalysis["correlations"] }) {
+  if (!correlations.length) return null;
+
+  return (
+    <article className="viz-card wide-viz-card">
+      <div className="viz-card-heading">
+        <h3>Correlation heatmap</h3>
+        <span>Strongest pairs</span>
+      </div>
+      <div className="heatmap-grid">
+        {correlations.map((item) => {
+          const strength = Math.abs(item.value);
+          return (
+            <div className={`heatmap-cell ${item.value >= 0 ? "positive" : "negative"}`} key={`${item.left}-${item.right}`} style={{ opacity: 0.35 + strength * 0.65 }}>
+              <span>{item.left}</span>
+              <strong>{formatNumber(item.value, 2)}</strong>
+              <span>{item.right}</span>
+            </div>
+          );
+        })}
+      </div>
+    </article>
+  );
+}
+
+function VisualizationDashboard({ analysis }: { analysis: DatasetAnalysis }) {
+  return (
+    <section className="report-section visualization-section">
+      <div className="section-heading"><h2>Important visualizations</h2><p>High-signal graphs for completeness, schema shape, numeric distributions, and relationships.</p></div>
+      <div className="visualization-grid">
+        <DonutGauge value={analysis.completeness} label="Complete cells" />
+        <TypeMixChart profiles={analysis.profiles} />
+        <MissingnessChart profiles={analysis.profiles} />
+        <DistributionCharts profiles={analysis.numericProfiles} />
+        <CorrelationHeatmap correlations={analysis.correlations} />
+      </div>
+    </section>
+  );
+}
+
 export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [analysis, setAnalysis] = useState<DatasetAnalysis | null>(null);
@@ -458,6 +642,8 @@ export default function Home() {
               <StatCard label="Complete" value={`${formatNumber(analysis.completeness)}%`} hint="Non-missing cells" />
               <StatCard label="Duplicates" value={formatNumber(analysis.duplicateRows, 0)} hint="Exact repeated rows" />
             </div>
+
+            <VisualizationDashboard analysis={analysis} />
 
             <div className="insight-panel">
               <div>
