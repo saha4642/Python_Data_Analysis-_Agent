@@ -20,9 +20,13 @@ type ColumnProfile = {
   max?: number;
   mean?: number;
   median?: number;
+  mode?: string;
   stdev?: number;
+  variance?: number;
   q1?: number;
   q3?: number;
+  iqr?: number;
+  range?: number;
   histogram?: Array<{ start: number; end: number; count: number; percent: number }>;
   timeline?: Array<{ label: string; count: number; percent: number }>;
   topValues: Array<{ value: string; count: number; percent: number }>;
@@ -193,8 +197,12 @@ function profileColumn(name: string, rows: DataRow[]): ColumnProfile {
       max: nums[nums.length - 1],
       mean,
       median: quantile(nums, 0.5),
+      mode: topValues[0]?.value,
       q1: quantile(nums, 0.25),
       q3: quantile(nums, 0.75),
+      iqr: quantile(nums, 0.75) - quantile(nums, 0.25),
+      range: nums[nums.length - 1] - nums[0],
+      variance,
       stdev: Math.sqrt(variance),
       histogram: buildHistogram(nums),
     };
@@ -510,10 +518,14 @@ function NumericSummary({ profiles }: { profiles: ColumnProfile[] }) {
             <span style={{ left: "75%" }} />
           </div>
           <dl>
-            <div><dt>Min</dt><dd>{formatNumber(profile.min)}</dd></div>
-            <div><dt>Median</dt><dd>{formatNumber(profile.median)}</dd></div>
             <div><dt>Mean</dt><dd>{formatNumber(profile.mean)}</dd></div>
-            <div><dt>Max</dt><dd>{formatNumber(profile.max)}</dd></div>
+            <div><dt>Median</dt><dd>{formatNumber(profile.median)}</dd></div>
+            <div><dt>Mode</dt><dd>{profile.mode ?? "—"}</dd></div>
+            <div><dt>Std. dev.</dt><dd>{formatNumber(profile.stdev)}</dd></div>
+            <div><dt>Variance</dt><dd>{formatNumber(profile.variance)}</dd></div>
+            <div><dt>Range</dt><dd>{formatNumber(profile.range)}</dd></div>
+            <div><dt>IQR</dt><dd>{formatNumber(profile.iqr)}</dd></div>
+            <div><dt>Min / Max</dt><dd>{formatNumber(profile.min)} / {formatNumber(profile.max)}</dd></div>
           </dl>
         </article>
       ))}
@@ -539,6 +551,108 @@ function TopValues({ profiles }: { profiles: ColumnProfile[] }) {
         </article>
       ))}
     </div>
+  );
+}
+
+
+function topColumnNames(profiles: ColumnProfile[], limit = 3): string {
+  return profiles.slice(0, limit).map((profile) => profile.name).join(", ") || "available columns";
+}
+
+function AnalysisRoadmap({ analysis }: { analysis: DatasetAnalysis }) {
+  const hasNumericPair = analysis.numericProfiles.length >= 2;
+  const hasCategoryPair = analysis.categoryProfiles.length >= 2;
+  const hasGroups = analysis.categoryProfiles.length >= 1 && analysis.numericProfiles.length >= 1;
+  const hasRegressionTarget = analysis.numericProfiles.length >= 1 && analysis.profiles.length >= 2;
+  const categoricalPair = hasCategoryPair ? analysis.categoryProfiles.slice(0, 2).map((profile) => profile.name).join(" × ") : "two categorical variables";
+  const groupExample = hasGroups ? `${analysis.numericProfiles[0].name} by ${analysis.categoryProfiles[0].name}` : "a numeric outcome by group";
+
+  const methodCards = [
+    {
+      title: "Descriptive statistics",
+      tag: "Required",
+      items: [
+        analysis.numericProfiles.length
+          ? `Use the numeric summary for central tendency and dispersion across ${topColumnNames(analysis.numericProfiles)}.`
+          : "Add numeric columns to compute mean, median, mode, variance, standard deviation, range, and IQR.",
+        analysis.categoryProfiles.length
+          ? `Use top-values cards as frequency distributions for ${topColumnNames(analysis.categoryProfiles)}.`
+          : "Categorical frequency tables will appear when repeated text or boolean values are detected.",
+      ],
+    },
+    {
+      title: "Categorical relationships",
+      tag: hasCategoryPair ? "Ready" : "Needs 2 categories",
+      items: [
+        hasCategoryPair
+          ? `Create a cross-tabulation for ${categoricalPair} to compare how categories interact.`
+          : "Upload or select at least two categorical variables for cross-tabulations.",
+        hasCategoryPair
+          ? "If the cross-tab counts are large enough, run a Chi-square test of independence to test association."
+          : "Chi-square testing becomes appropriate after there are enough observations across category combinations.",
+      ],
+    },
+    {
+      title: "Inferential tests",
+      tag: hasNumericPair || hasGroups ? "Candidate" : "Limited",
+      items: [
+        hasNumericPair
+          ? `Investigate correlation significance for numeric pairs such as ${analysis.numericProfiles[0].name} and ${analysis.numericProfiles[1].name}.`
+          : "Correlation analysis requires at least two continuous numeric variables.",
+        hasGroups
+          ? `Use t-tests for two-group comparisons or ANOVA for multi-group comparisons, for example ${groupExample}.`
+          : "Group comparisons require a categorical grouping field and a numeric measure.",
+        "Use Mann-Whitney U or Kruskal-Wallis when normality or equal-variance assumptions are not reasonable.",
+      ],
+    },
+    {
+      title: "Regression modeling",
+      tag: hasRegressionTarget ? "Plan" : "Needs target",
+      items: [
+        hasRegressionTarget
+          ? `For a continuous outcome like ${analysis.numericProfiles[0].name}, compare simple and multiple linear regression with relevant predictors.`
+          : "Linear regression requires a continuous dependent variable plus one or more predictors.",
+        analysis.categoryProfiles.length
+          ? `For a binary outcome, consider logistic regression if a field such as ${analysis.categoryProfiles[0].name} can be coded as yes/no or success/failure.`
+          : "Logistic regression applies when the dependent variable is binary.",
+      ],
+    },
+  ];
+
+  const visualizationOptions = [
+    "Histogram, KDE, boxplot, or violin plot for numeric distributions",
+    "Scatter, regression, hex, or heatmap views for relationships",
+    "Bar, count, grouped bar, or line plots for category and time comparisons",
+    "Pie, stacked bar, or area charts for part-to-whole stories",
+    "Pair plots, joint plots, interactive, geospatial, network, radial, or 3D views for advanced exploration",
+  ];
+
+  return (
+    <section className="report-section roadmap-section">
+      <div className="section-heading">
+        <h2>Assignment-ready analysis roadmap</h2>
+        <p>Recommended statistical methods and visualization options based on the detected column types.</p>
+      </div>
+      <div className="roadmap-grid">
+        {methodCards.map((card) => (
+          <article className="roadmap-card" key={card.title}>
+            <div className="roadmap-card-heading">
+              <h3>{card.title}</h3>
+              <span>{card.tag}</span>
+            </div>
+            <ul>
+              {card.items.map((item) => <li key={item}>{item}</li>)}
+            </ul>
+          </article>
+        ))}
+      </div>
+      <div className="visualization-options">
+        <h3>Visualization menu</h3>
+        <div>
+          {visualizationOptions.map((option) => <span key={option}>{option}</span>)}
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -838,6 +952,8 @@ export default function Home() {
 
             <VisualizationDashboard analysis={analysis} />
 
+            <AnalysisRoadmap analysis={analysis} />
+
             <div className="insight-panel">
               <div>
                 <p className="eyebrow">Key takeaways</p>
@@ -854,7 +970,7 @@ export default function Home() {
             </section>
 
             <section className="report-section">
-              <div className="section-heading"><h2>Numeric summary</h2><p>Distribution basics for numeric columns.</p></div>
+              <div className="section-heading"><h2>Numeric summary</h2><p>Central tendency and dispersion for numeric columns, including mean, median, mode, standard deviation, variance, range, and IQR.</p></div>
               <NumericSummary profiles={analysis.numericProfiles} />
             </section>
 
