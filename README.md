@@ -49,6 +49,25 @@ npm run dev
 
 Open <http://localhost:3000>, upload a CSV/XLSX/JSON file, and use the controls for descriptive statistics, categorical cross-tabs, hypothesis tests, regression models, and Plotly visualizations. Plotly is loaded in the browser from the official Plotly CDN when the visualization panel renders.
 
+
+### Streamlit analytics app
+
+The repository also includes a standalone Streamlit implementation that keeps the working Next.js app intact while offering a Python-first analytics dashboard. It supports CSV, XLSX, and JSON uploads; optional duplicate removal, missing-value filling, datetime conversion, and IQR outlier filtering; and computed tabs for dataset overview, written summary analysis, descriptive statistics, categorical cross-tabs with Chi-square tests, inferential tests, regression modeling, Plotly visualizations, and report export.
+
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
+
+For the student performance smoke test, launch Streamlit, upload `student-mat.csv`, and verify these workflows:
+
+- **Summary Analysis** references the actual uploaded row/column counts, detected numeric/categorical/binary columns, missing values, duplicates, key means, variation, skewness, outliers, correlations, categorical dominance, and recommended next steps.
+- **Descriptive Statistics** includes numeric summaries for `age`, `Medu`, and `Fedu`, plus frequency tables for `school`, `sex`, and `address`.
+- **Categorical Analysis** selects `school` × `sex` and displays observed and normalized cross-tabs, expected frequencies, Chi-square statistic, p-value, degrees of freedom, and significance interpretation.
+- **Inferential Tests** selects Pearson correlation for `age` and `Medu` and displays statistic, p-value, paired sample size, and α = 0.05 interpretation.
+- **Regression Modeling** selects linear regression with `age` as target and `Medu`/`Fedu` as predictors to display coefficients, intercept, R², adjusted R², p-values, residual summary, and residual plot.
+- **Visualizations** renders histogram, boxplot, scatter plot, heatmap, bar chart, and grouped bar chart directly from the uploaded dataset.
+
 ### Optional Terminal 2: analytics backend
 
 ```bash
