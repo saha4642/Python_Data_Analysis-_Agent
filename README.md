@@ -1,113 +1,124 @@
-# InsightForge AI Analytics Platform
+# InsightForge AI Data Analysis App
 
-InsightForge is a production-ready AI-powered data analysis web application that turns CSV, Excel, and JSON datasets into an interactive exploratory data analysis (EDA), statistical testing, visualization, regression, and ML-preparation workspace.
+InsightForge is an AI-assisted data analysis workspace with two runnable experiences in one repository:
 
-The product is designed to feel like an enterprise analytics platform inspired by Tableau, Power BI, and Hex, while focusing on automated AI-driven profiling and statistical modeling.
+- `streamlit_app.py` — the main Python/Streamlit data analysis app.
+- The existing Next.js + FastAPI stack for API-oriented analytics workflows.
 
-## Highlights
+The Streamlit app remains the primary entry point for the Python data analysis experience and computes every dashboard, model, chart, answer, and report from the uploaded dataset.
 
-- **Next.js App Router + TypeScript frontend** with a polished responsive dashboard, sidebar navigation, dark/light theme toggle, drag-and-drop uploads, upload progress, preview tables, cards, accordions, filters, and export actions.
-- **Python FastAPI analytics backend** using Pandas, NumPy, SciPy, Statsmodels, Scikit-learn, and Plotly.
-- **Dataset support** for CSV, XLS, XLSX, and JSON with multi-file upload and in-memory dataset caching.
-- **Automatic EDA** for numerical, categorical, boolean, and datetime columns, missing values, duplicates, outliers, top values, descriptive statistics, and correlation signals.
-- **Inferential statistics** for Pearson/Spearman correlation, t-tests, ANOVA, chi-square, Mann-Whitney U, and Kruskal-Wallis.
-- **Regression and ML modules** for linear regression, logistic regression, Random Forest, Decision Tree, KNN, and SVM with train/test split, cross-validation, diagnostics, confusion matrices, accuracy, ROC AUC, and regression errors.
-- **Plotly visualization workspace** for histograms, KDE-style distributions, box/violin plots, scatter and regression plots, line/area/bar/count/grouped/stacked charts, heatmaps, pair plot approximations, area charts, pie charts, and 3D scatter when enough numeric columns exist.
-- **AI insights layer** that summarizes data quality, trends, anomalies, correlations, and modeling recommendations.
-- **Export-ready reports** for PNG placeholders, CSV profiles, HTML reports, PDF-compatible HTML payloads, and Plotly chart HTML snippets.
+## Streamlit feature overview
 
-## Folder structure
+- **Dataset workflow**: upload CSV, XLSX, or JSON files; show the uploaded file name; apply duplicate removal, missing-value handling, datetime conversion, and optional IQR outlier filtering.
+- **Storytelling Dashboard**: executive summary, KPI cards, key findings cards, recommended Plotly charts, chart captions, and a plain-English data story.
+- **Descriptive and categorical analysis**: numeric descriptive statistics, categorical frequency tables, cross-tabs, and Chi-square analysis.
+- **Inferential statistics**: Pearson/Spearman correlations, t-test, ANOVA, Mann-Whitney U, and Kruskal-Wallis where data types support them.
+- **Machine Learning**: regression and classification workflows with one-hot encoding, missing-value imputation, train/test controls, metrics, plots, feature importance, and model interpretation.
+- **Ask Your Data**: chat-style Q&A over safe dataset summaries. Uses OpenAI when `OPENAI_API_KEY` is available and falls back to rule-based answers when it is not.
+- **Business Report**: generated Markdown and HTML reports with downloadable summary CSV tables and timestamped filenames.
+- **Collaboration-friendly session state**: reset button, persisted test/model/chat state, timestamped report generation, and a sidebar app version label.
 
-```text
-app/
-  api/
-    health/route.ts        # Frontend API health endpoint
-    report/route.ts        # Report payload endpoint
-  globals.css              # Tailwind-inspired enterprise UI system
-  layout.tsx               # App metadata and root layout
-  page.tsx                 # Interactive analytics dashboard
-backend/
-  analytics_engine.py      # FastAPI + reusable analytics/ML logic
-Dockerfile                 # Container build for backend-first deployment
-.env.example               # Environment variable template
-package.json               # Next.js scripts/dependencies
-requirements.txt           # Python analytics dependencies
-README.md                  # Documentation and deployment guide
-```
+## Supported file types
 
+The Streamlit app supports:
 
-## Running the full analysis app
+- `.csv`
+- `.xlsx`
+- `.json`
 
-The app now computes the assignment sections from the uploaded rows in the browser immediately after upload. The optional FastAPI backend remains available for API-based workflows, including SciPy-backed `chi2_contingency`, but the visible dashboard no longer depends on static roadmap cards.
+All outputs are based on the uploaded file after the cleaning options selected in the sidebar.
 
-### Terminal 1: install and run the Next.js app
+## Local setup
 
 ```bash
-npm install
-npm run dev
-```
-
-Open <http://localhost:3000>, upload a CSV/XLSX/JSON file, and use the controls for descriptive statistics, categorical cross-tabs, hypothesis tests, regression models, and Plotly visualizations. Plotly is loaded in the browser from the official Plotly CDN when the visualization panel renders.
-
-
-### Streamlit analytics app
-
-The repository also includes a standalone Streamlit implementation that keeps the working Next.js app intact while offering a Python-first analytics dashboard. It supports CSV, XLSX, and JSON uploads; optional duplicate removal, missing-value filling, datetime conversion, and IQR outlier filtering; and computed tabs for dataset overview, written summary analysis, descriptive statistics, categorical cross-tabs with Chi-square tests, inferential tests, regression modeling, Plotly visualizations, and report export.
-
-```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-For the student performance smoke test, launch Streamlit, upload `student-mat.csv`, and verify these workflows:
+Then open the local Streamlit URL shown in the terminal, upload a supported dataset, and use the tabs across the top of the app.
 
-- **Summary Analysis** references the actual uploaded row/column counts, detected numeric/categorical/binary columns, missing values, duplicates, key means, variation, skewness, outliers, correlations, categorical dominance, and recommended next steps.
-- **Descriptive Statistics** includes numeric summaries for `age`, `Medu`, and `Fedu`, plus frequency tables for `school`, `sex`, and `address`.
-- **Categorical Analysis** selects `school` × `sex` and displays observed and normalized cross-tabs, expected frequencies, Chi-square statistic, p-value, degrees of freedom, and significance interpretation.
-- **Inferential Tests** selects Pearson correlation for `age` and `Medu` and displays statistic, p-value, paired sample size, and α = 0.05 interpretation.
-- **Regression Modeling** selects linear regression with `age` as target and `Medu`/`Fedu` as predictors to display coefficients, intercept, R², adjusted R², p-values, residual summary, and residual plot.
-- **Visualizations** renders histogram, boxplot, scatter plot, heatmap, bar chart, and grouped bar chart directly from the uploaded dataset.
+## OpenAI API key and secrets
 
-### Optional Terminal 2: analytics backend
+The Ask Your Data tab works without an API key by using deterministic rule-based answers from computed summaries. To enable OpenAI-generated natural-language answers:
+
+### Local Streamlit secrets
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-npm run backend
+mkdir -p .streamlit
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 ```
 
-The backend runs at <http://localhost:8000> and exposes reusable Pandas/SciPy/Statsmodels/Scikit-learn endpoints for uploads, Chi-square, Pearson/Spearman, t-tests, ANOVA, Mann-Whitney U, Kruskal-Wallis, Plotly JSON, and model training.
+Edit `.streamlit/secrets.toml`:
 
-### Student performance smoke test
+```toml
+OPENAI_API_KEY = "sk-your-key-here"
+```
 
-Use `student-mat.csv` from the UCI Student Performance dataset. After upload, verify these exact UI outputs:
-
-- **Descriptive Statistics** shows numeric rows for `age`, `Medu`, and `Fedu` with mean, median, mode, standard deviation, variance, min, max, range, IQR, skewness, kurtosis, and missing count.
-- **Categorical columns** shows frequency tables and percentages for `school`, `sex`, and `address`.
-- **Categorical relationship analysis**: select `school` and `sex` to display the observed cross-tab, expected frequencies, Chi-square statistic, p-value, degrees of freedom, and plain-English interpretation.
-- **Inferential statistics**: select Pearson correlation with `age` and `Medu` to display statistic, p-value, paired sample size, assumptions, and interpretation.
-- **Visualization studio**: select a box/violin/grouped bar chart by `school`, and select the heatmap option to render the numeric correlation matrix.
-- **Regression modeling**: select multiple linear regression, target `age`, and predictors `Medu` and `Fedu` to display coefficients, intercept, R², p-values, residual summary, sample size, and interpretation.
-
-### Production build check
+You can also set an environment variable instead:
 
 ```bash
-npm run build
+export OPENAI_API_KEY="sk-your-key-here"
 ```
 
-## Local development
+The app sends only metadata, summary statistics, categorical summaries, correlations, and session model summaries to the API. It does not send the full raw dataset.
 
-### 1. Frontend
+## Streamlit Community Cloud deployment
+
+1. Push this repository to GitHub.
+2. Go to [Streamlit Community Cloud](https://streamlit.io/cloud) and choose **New app**.
+3. Select the repository, branch, and set the main file path to:
+
+   ```text
+   streamlit_app.py
+   ```
+
+4. Keep `requirements.txt` in the repository root so dependencies install automatically.
+5. If using OpenAI in Ask Your Data, open **App settings → Secrets** and add:
+
+   ```toml
+   OPENAI_API_KEY = "sk-your-key-here"
+   ```
+
+6. Deploy. Upload a CSV, XLSX, or JSON file in the app sidebar to begin analysis.
+
+## Student performance smoke test
+
+Use `student-mat.csv` from the UCI Student Performance dataset and verify:
+
+- **Storytelling Dashboard** shows real KPI cards for row count, column count, missing-value percentage, duplicate row count, numeric columns, and categorical columns.
+- **Storytelling Dashboard** shows key finding cards for correlations, variability, category imbalance, and missingness, plus chart captions.
+- **Machine Learning → regression** runs with `age` as target and `Medu`/`Fedu` as predictors.
+- **Machine Learning → classification** runs with `school` or `sex` as target.
+- **Ask Your Data** answers questions about columns, missing values, correlations, and summary statistics.
+- **Business Report** previews and downloads Markdown, HTML, and CSV summary tables.
+- The app starts with:
+
+  ```bash
+  pip install -r requirements.txt
+  streamlit run streamlit_app.py
+  ```
+
+## Troubleshooting
+
+- **Upload fails**: confirm the file extension is CSV, XLSX, or JSON and that the file is not password protected.
+- **Charts do not appear**: some recommended charts require numeric or categorical columns with enough non-missing data.
+- **Model cannot train**: select at least one predictor, avoid using the target as a predictor, and make sure the target has enough non-missing values and variation.
+- **Classification split error**: choose a target with at least two classes and enough examples per class, or reduce the test split.
+- **OpenAI answer fails**: check that `OPENAI_API_KEY` is present in Streamlit secrets or the environment. The app will fall back to rule-based answers if no key is available.
+- **Report table formatting looks plain**: Markdown reports preserve table text for portability; use the HTML download for a browser-friendly business report.
+
+## Existing full-stack app
+
+The repository also contains a Next.js frontend and FastAPI backend for API-based analytics. To run those components:
 
 ```bash
 npm install
 npm run dev
 ```
 
-Open <http://localhost:3000>.
-
-### 2. Backend
+In another terminal:
 
 ```bash
 python -m venv .venv
@@ -116,115 +127,4 @@ pip install -r requirements.txt
 npm run backend
 ```
 
-The FastAPI service runs at <http://localhost:8000>. API docs are available at <http://localhost:8000/docs>.
-
-### 3. Environment
-
-```bash
-cp .env.example .env.local
-```
-
-Important variables:
-
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `NEXT_PUBLIC_ANALYTICS_API_URL` | Frontend URL for the Python analytics API | `http://localhost:8000` |
-| `MAX_MEMORY_ROWS` | Maximum rows retained per cached dataset | `250000` |
-| `CORS_ORIGINS` | Comma-separated allowed frontend origins | `http://localhost:3000` |
-
-## API overview
-
-### `POST /upload`
-
-Uploads one or more datasets and returns a cached `dataset_id`, preview rows, and full analysis.
-
-### `GET /datasets/{dataset_id}/analysis`
-
-Returns dataset overview, inferred column groups, descriptive statistics, outliers, duplicate counts, missingness, Pearson/Spearman correlations, and AI insights.
-
-### `POST /statistics`
-
-Runs inferential tests:
-
-- `ttest`
-- `anova`
-- `chi_square`
-- `mann_whitney`
-- `kruskal`
-
-### `POST /visualizations`
-
-Returns Plotly JSON for supported charts:
-
-- Histogram / KDE-style distribution
-- Box and violin plots
-- Scatter and regression plots
-- Line, area, bar, count, pie, and stacked bar charts
-- Heatmap correlation matrix
-- Pair plot approximations and 3D scatter plots
-- Hexbin-style scatter
-- 3D scatter
-- Geospatial scatter
-
-### `POST /models`
-
-Trains baseline regression or classification models with preprocessing pipelines:
-
-- Linear regression
-- Logistic regression
-- Random Forest
-- Decision Tree
-- KNN
-- SVM
-
-Returns metrics such as R², RMSE, MAE, accuracy, ROC AUC, confusion matrix, cross-validation scores, and residual diagnostics where applicable.
-
-### `GET /datasets/{dataset_id}/report`
-
-Returns a report-ready payload for HTML/PDF/CSV/PNG export workflows.
-
-## Performance and scalability notes
-
-- The frontend parses and previews files quickly for a responsive first interaction.
-- The backend exposes server-side processing endpoints for large datasets and expensive statistical/ML workloads.
-- Table previews are capped and scrollable to avoid rendering thousands of DOM rows.
-- Chart payloads are generated on demand to avoid unnecessary Plotly rendering cost.
-- `MAX_MEMORY_ROWS` protects memory use in simple deployments; production systems should swap the in-memory cache for Redis, S3, DuckDB, or a data warehouse.
-
-## Docker
-
-Build and run the backend container:
-
-```bash
-docker build -t insightforge .
-docker run --rm -p 8000:8000 --env-file .env.example insightforge
-```
-
-For full-stack production, deploy the Next.js app separately on Vercel and the FastAPI service on Railway or Render.
-
-## Deployment
-
-### Vercel frontend
-
-1. Import the repository in Vercel.
-2. Set `NEXT_PUBLIC_ANALYTICS_API_URL` to your backend URL.
-3. Use the default Next.js build command: `npm run build`.
-4. Deploy.
-
-### Railway backend
-
-1. Create a Railway project from the repository.
-2. Select the Dockerfile deployment path.
-3. Set environment variables from `.env.example`.
-4. Expose port `8000`.
-
-### Render backend
-
-1. Create a new Web Service.
-2. Use Docker as the runtime.
-3. Set `PORT=8000`, `MAX_MEMORY_ROWS`, and `CORS_ORIGINS`.
-4. Deploy and copy the service URL into Vercel as `NEXT_PUBLIC_ANALYTICS_API_URL`.
-
-## Notes on shadcn/ui and Tailwind CSS
-
-The current UI uses a Tailwind-inspired utility design system in `app/globals.css` and shadcn-style primitives (cards, pills, accordions, buttons, inputs, panels, sidebar navigation). If you want strict generated shadcn components, run `npx shadcn@latest init` and map the existing panel/card/button styles into `components/ui/*`.
+The Streamlit entry point remains `streamlit_app.py` and is safe to deploy independently on Streamlit Community Cloud.
