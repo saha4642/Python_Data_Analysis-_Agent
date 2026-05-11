@@ -7,7 +7,10 @@ Scikit-learn, and Plotly) to compute real statistics from the uploaded dataset.
 
 from __future__ import annotations
 
+import html
 import io
+import os
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,11 +24,22 @@ import streamlit as st
 from scipy import stats
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LogisticRegression
+from openai import OpenAI
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
     confusion_matrix,
+    f1_score,
+    mean_absolute_error,
+    mean_squared_error,
+    precision_score,
+    r2_score,
+    recall_score,
+    roc_auc_score,
     roc_curve,
 )
 from sklearn.model_selection import train_test_split
@@ -591,6 +605,372 @@ def build_report(df: pd.DataFrame, original_df: pd.DataFrame, cleaning_notes: li
     return "\n".join(sections)
 
 
+
+# -----------------------------------------------------------------------------
+# Storytelling, ML, chat, and business-report helpers
+# -----------------------------------------------------------------------------
+def safe_pct(numerator: float, denominator: float) -> float:
+    return float(numerator / denominator * 100) if denominator else 0.0
+
+
+def summarize_key_findings(df: pd.DataFrame) -> dict[str, str]:
+    types = infer_column_types(df)
+    relationships = compute_relationship_findings(df)
+    num_stats = numeric_descriptive_stats(df)
+    cat_stats = categorical_summary(df)
+    missing = df.isna().mean().sort_values(ascending=False)
+
+    positive = "Not available — fewer than two numeric columns with enough variation."
+    if relationships.get("positive"):
+        left, right, corr, _, n = relationships["positive"]
+        positive = f"{left} ↔ {right} (r={corr:.3f}, n={n:,})"
+
+    negative = "Not available — fewer than two numeric columns with enough variation."
+    if relationships.get("negative"):
+        left, right, corr, _, n = relationships["negative"]
+        negative = f"{left} ↔ {right} (r={corr:.3f}, n={n:,})"
+
+    variable = "No numeric columns detected."
+    if not num_stats.empty and "std" in num_stats:
+        variable_col = num_stats["std"].fillna(-np.inf).idxmax()
+        variable = f"{variable_col} (standard deviation {num_stats.loc[variable_col, 'std']:.3g})"
+
+    imbalanced = "No categorical columns detected."
+    if not cat_stats.empty:
+        imbalanced_col = cat_stats["top_percent"].fillna(0).idxmax()
+        row = cat_stats.loc[imbalanced_col]
+        imbalanced = f"{imbalanced_col}: {row['top_value']} is {row['top_percent']:.1f}% of rows"
+
+    missing_col = "No missing values detected."
+    if not missing.empty and missing.iloc[0] > 0:
+        missing_col = f"{missing.index[0]} ({missing.iloc[0] * 100:.1f}% missing)"
+
+    return {
+        "strongest_positive_correlation": positive,
+        "strongest_negative_correlation": negative,
+        "most_variable_numeric_column": variable,
+        "most_imbalanced_categorical_column": imbalanced,
+        "highest_missing_value_column": missing_col,
+        "numeric_count": str(len(types.numeric)),
+        "categorical_count": str(len(set(types.categorical + types.binary))),
+    }
+
+
+def storytelling_text(df: pd.DataFrame, original_df: pd.DataFrame, cleaning_notes: list[str]) -> str:
+    types = infer_column_types(df)
+    findings = summarize_key_findings(df)
+    missing_pct = safe_pct(df.isna().sum().sum(), df.shape[0] * df.shape[1])
+    quality_risk = "low" if missing_pct < 5 and df.duplicated().sum() == 0 else "moderate to high"
+    dominant_types = []
+    if types.numeric:
+        dominant_types.append(f"{len(types.numeric)} numeric measures")
+    if types.categorical or types.binary:
+        dominant_types.append(f"{len(set(types.categorical + types.binary))} categorical/binary descriptors")
+    if types.datetime:
+        dominant_types.append(f"{len(types.datetime)} datetime fields")
+    contains = ", ".join(dominant_types) or "general tabular fields"
+    return "\n".join([
+        f"This uploaded dataset contains **{df.shape[0]:,} cleaned rows** and **{df.shape[1]:,} columns**, with {contains}. The original upload had {original_df.shape[0]:,} rows and {original_df.shape[1]:,} columns.",
+        f"Patterns that stand out include the strongest positive relationship of **{findings['strongest_positive_correlation']}**, the strongest negative relationship of **{findings['strongest_negative_correlation']}**, and variation concentrated in **{findings['most_variable_numeric_column']}**.",
+        f"Data-quality risk is **{quality_risk}**: missingness is {missing_pct:.1f}% of cells, duplicate rows total {int(df.duplicated().sum()):,}, and the highest missingness signal is **{findings['highest_missing_value_column']}**.",
+        "Next, investigate whether the strongest relationships are practically meaningful, whether dominant categories bias conclusions, and which predictors explain the most important outcomes for the business or academic question.",
+        "Cleaning notes: " + "; ".join(cleaning_notes[:4]),
+    ])
+
+
+def recommended_story_charts(df: pd.DataFrame) -> list[tuple[str, go.Figure, str]]:
+    types = infer_column_types(df)
+    charts: list[tuple[str, go.Figure, str]] = []
+    if types.numeric:
+        col = numeric_descriptive_stats(df)["std"].fillna(0).idxmax() if not numeric_descriptive_stats(df).empty else types.numeric[0]
+        charts.append(("Distribution", px.histogram(df, x=col, marginal="box", title=f"Distribution of {col}"), f"This chart shows the spread, center, and possible outliers for {col}, the numeric field with the highest variability."))
+    if len(types.numeric) >= 2:
+        relationships = compute_relationship_findings(df)
+        pair = relationships.get("positive") or relationships.get("negative")
+        if pair:
+            x, y = pair[0], pair[1]
+            charts.append(("Relationship", px.scatter(df, x=x, y=y, trendline="ols", title=f"Relationship: {y} vs {x}"), f"This scatter plot highlights the strongest detected numeric relationship between {x} and {y}."))
+        corr = df[types.numeric].corr(numeric_only=True)
+        charts.append(("Correlation Heatmap", px.imshow(corr, text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1, title="Numeric Correlation Heatmap"), "This heatmap summarizes pairwise numeric relationships; darker colors indicate stronger associations."))
+    cat_cols = sorted(set(types.categorical + types.binary))
+    if cat_cols:
+        col = categorical_summary(df)["top_percent"].fillna(0).idxmax() if not categorical_summary(df).empty else cat_cols[0]
+        counts = df[col].astype("object").fillna("<Missing>").value_counts().head(15).reset_index()
+        counts.columns = [col, "count"]
+        charts.append(("Category Mix", px.bar(counts, x=col, y="count", title=f"Top categories in {col}"), f"This bar chart shows the most common values for {col} and whether one category dominates the dataset."))
+    return charts[:4]
+
+
+def make_preprocessor(x: pd.DataFrame, scale_numeric: bool = False) -> ColumnTransformer:
+    numeric_features = x.select_dtypes(include=np.number).columns.tolist()
+    categorical_features = [col for col in x.columns if col not in numeric_features]
+    transformers: list[tuple[str, Pipeline, list[str]]] = []
+    if numeric_features:
+        steps: list[tuple[str, Any]] = [("imputer", SimpleImputer(strategy="median"))]
+        if scale_numeric:
+            steps.append(("scaler", StandardScaler()))
+        transformers.append(("num", Pipeline(steps), numeric_features))
+    if categorical_features:
+        transformers.append(("cat", Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))]), categorical_features))
+    return ColumnTransformer(transformers=transformers, remainder="drop", verbose_feature_names_out=False)
+
+
+def get_feature_names(model: Pipeline) -> list[str]:
+    return [str(name) for name in model.named_steps["preprocess"].get_feature_names_out()]
+
+
+def train_ml_model(df: pd.DataFrame, target: str, predictors: list[str], problem_type: str, model_name: str, test_size: float, random_state: int) -> dict[str, Any]:
+    if target in predictors:
+        return {"valid": False, "message": "The target column cannot also be used as a predictor."}
+    if not predictors:
+        return {"valid": False, "message": "Select at least one predictor column."}
+    model_df = df[[target] + predictors].copy()
+    model_df = model_df.dropna(subset=[target])
+    if len(model_df) < 10:
+        return {"valid": False, "message": "At least 10 rows with a non-missing target are required."}
+    x = model_df[predictors]
+    y_raw = model_df[target]
+    if x.dropna(how="all").empty:
+        return {"valid": False, "message": "Predictors are empty after removing rows with missing targets."}
+
+    if problem_type == "auto-detect":
+        problem_type = "regression" if pd.api.types.is_numeric_dtype(y_raw) and y_raw.nunique(dropna=True) > 10 else "classification"
+    if problem_type == "regression":
+        y = pd.to_numeric(y_raw, errors="coerce")
+        valid_y = y.notna()
+        x = x.loc[valid_y]
+        y = y.loc[valid_y]
+        if y.nunique() < 2:
+            return {"valid": False, "message": "Regression requires a numeric target with at least two distinct values."}
+        models = {
+            "Linear Regression": LinearRegression(),
+            "Random Forest Regressor": RandomForestRegressor(n_estimators=200, random_state=random_state),
+            "Decision Tree Regressor": DecisionTreeRegressor(random_state=random_state),
+        }
+        estimator = models[model_name]
+        pipeline = Pipeline([("preprocess", make_preprocessor(x, scale_numeric=model_name == "Linear Regression")), ("model", estimator)])
+        x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=test_size, random_state=random_state)
+        pipeline.fit(x_train, y_train)
+        predictions = pipeline.predict(x_test)
+        rmse = mean_squared_error(y_test, predictions) ** 0.5
+        result = {
+            "valid": True, "problem_type": "regression", "model_name": model_name, "target": target, "predictors": predictors,
+            "n_train": int(len(x_train)), "n_test": int(len(x_test)),
+            "mae": float(mean_absolute_error(y_test, predictions)), "rmse": float(rmse), "r2": float(r2_score(y_test, predictions)),
+            "predictions": pd.DataFrame({"actual": y_test, "predicted": predictions, "residual": y_test - predictions}),
+        }
+    else:
+        y = y_raw.astype("object")
+        if y.nunique(dropna=True) < 2:
+            return {"valid": False, "message": "Classification requires at least two target classes."}
+        class_counts = y.value_counts()
+        stratify = y if class_counts.min() >= 2 else None
+        models = {
+            "Logistic Regression": LogisticRegression(max_iter=2000),
+            "Random Forest Classifier": RandomForestClassifier(n_estimators=200, random_state=random_state),
+            "Decision Tree Classifier": DecisionTreeClassifier(random_state=random_state),
+            "KNN Classifier": KNeighborsClassifier(),
+        }
+        estimator = models[model_name]
+        pipeline = Pipeline([("preprocess", make_preprocessor(x, scale_numeric=model_name in {"Logistic Regression", "KNN Classifier"}),), ("model", estimator)])
+        x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=test_size, random_state=random_state, stratify=stratify)
+        if y_train.nunique() < 2:
+            return {"valid": False, "message": "The train split contains fewer than two classes. Try a smaller test split or a target with more examples per class."}
+        pipeline.fit(x_train, y_train)
+        predictions = pipeline.predict(x_test)
+        labels = sorted(y.astype(str).unique().tolist())
+        cm = pd.DataFrame(confusion_matrix(y_test.astype(str), pd.Series(predictions).astype(str), labels=labels), index=[f"Actual {v}" for v in labels], columns=[f"Predicted {v}" for v in labels])
+        report = pd.DataFrame(classification_report(y_test, predictions, output_dict=True, zero_division=0)).T
+        result = {
+            "valid": True, "problem_type": "classification", "model_name": model_name, "target": target, "predictors": predictors,
+            "n_train": int(len(x_train)), "n_test": int(len(x_test)), "accuracy": float(accuracy_score(y_test, predictions)),
+            "precision": float(precision_score(y_test, predictions, average="weighted", zero_division=0)),
+            "recall": float(recall_score(y_test, predictions, average="weighted", zero_division=0)),
+            "f1": float(f1_score(y_test, predictions, average="weighted", zero_division=0)),
+            "confusion_matrix": cm, "classification_report": report, "classes": labels,
+        }
+        if len(labels) == 2 and hasattr(pipeline.named_steps["model"], "predict_proba"):
+            probabilities = pipeline.predict_proba(x_test)[:, 1]
+            y_binary = (y_test.astype(str) == labels[1]).astype(int)
+            fpr, tpr, _ = roc_curve(y_binary, probabilities)
+            result["roc"] = pd.DataFrame({"fpr": fpr, "tpr": tpr})
+            result["roc_auc"] = float(roc_auc_score(y_binary, probabilities))
+
+    feature_names = get_feature_names(pipeline)
+    fitted = pipeline.named_steps["model"]
+    importance = None
+    if hasattr(fitted, "feature_importances_"):
+        importance = pd.DataFrame({"feature": feature_names, "importance": fitted.feature_importances_}).sort_values("importance", ascending=False)
+    elif hasattr(fitted, "coef_"):
+        coefs = np.ravel(fitted.coef_[0] if np.ndim(fitted.coef_) > 1 else fitted.coef_)
+        importance = pd.DataFrame({"feature": feature_names[: len(coefs)], "importance": np.abs(coefs)}).sort_values("importance", ascending=False)
+    result["feature_importance"] = importance
+    return result
+
+
+def model_interpretation(result: dict[str, Any]) -> str:
+    if not result.get("valid"):
+        return result.get("message", "Model could not be trained.")
+    top = "not available"
+    if isinstance(result.get("feature_importance"), pd.DataFrame) and not result["feature_importance"].empty:
+        top = ", ".join(result["feature_importance"].head(3)["feature"].astype(str).tolist())
+    if result["problem_type"] == "regression":
+        return f"The {result['model_name']} model predicts {result['target']} with RMSE {result['rmse']:.3g}, MAE {result['mae']:.3g}, and R² {result['r2']:.3f}. The most influential available predictors are {top}. Compare residual spread before using this for decisions."
+    return f"The {result['model_name']} model predicts {result['target']} with accuracy {result['accuracy']:.3f} and weighted F1 {result['f1']:.3f}. The most influential available predictors are {top}. Review class balance and confusion-matrix errors before acting on predictions."
+
+
+def dataset_context(df: pd.DataFrame) -> dict[str, Any]:
+    types = infer_column_types(df)
+    num_stats = numeric_descriptive_stats(df).round(4).head(20)
+    cat_stats = categorical_summary(df).round(4).head(20)
+    corr = df[types.numeric].corr(numeric_only=True).round(3).head(12).to_dict() if len(types.numeric) >= 2 else {}
+    return {
+        "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
+        "columns": df.columns.tolist(),
+        "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
+        "missing_values": df.isna().sum().astype(int).to_dict(),
+        "numeric_stats": num_stats.to_dict() if not num_stats.empty else {},
+        "categorical_summary": cat_stats.to_dict() if not cat_stats.empty else {},
+        "correlations": corr,
+        "model_results": st.session_state.get("ml_results", {}).get("summary", "No ML model has been run yet."),
+    }
+
+
+def rule_based_answer(question: str, df: pd.DataFrame) -> str:
+    q = question.lower()
+    ctx = dataset_context(df)
+    if any(word in q for word in ["column", "field", "variable"]):
+        return f"The dataset has {df.shape[1]:,} columns: " + ", ".join(df.columns.astype(str).tolist()[:40]) + ("..." if df.shape[1] > 40 else "")
+    if any(word in q for word in ["missing", "null", "na"]):
+        missing = df.isna().sum().sort_values(ascending=False)
+        top = missing[missing > 0].head(10)
+        if top.empty:
+            return "No missing values are present in the cleaned uploaded dataset."
+        return "Columns with the most missing values are: " + "; ".join(f"{col}: {int(val):,}" for col, val in top.items()) + "."
+    if any(word in q for word in ["correlation", "relationship", "related"]):
+        findings = summarize_key_findings(df)
+        return f"Strongest positive correlation: {findings['strongest_positive_correlation']}. Strongest negative correlation: {findings['strongest_negative_correlation']}."
+    if any(word in q for word in ["summary", "describe", "statistics", "mean", "median"]):
+        stats_df = numeric_descriptive_stats(df)
+        if stats_df.empty:
+            return "There are no numeric columns available for descriptive statistics."
+        cols = stats_df.head(8)
+        return "Numeric summary highlights: " + "; ".join(f"{idx} mean={row['mean']:.3g}, median={row['median']:.3g}" for idx, row in cols.iterrows()) + "."
+    if any(word in q for word in ["shape", "rows", "size"]):
+        return f"The cleaned uploaded dataset has {ctx['shape']['rows']:,} rows and {ctx['shape']['columns']:,} columns."
+    return "I can answer from dataset summaries. Try asking about columns, missing values, descriptive statistics, correlations, categories, or model results."
+
+
+def answer_with_openai(question: str, df: pd.DataFrame) -> str:
+    api_key = None
+    try:
+        api_key = st.secrets.get("OPENAI_API_KEY", None)
+    except Exception:
+        api_key = None
+    api_key = api_key or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return rule_based_answer(question, df)
+    client = OpenAI(api_key=api_key)
+    ctx = dataset_context(df)
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You answer questions about an uploaded dataset using only the supplied safe summaries. Do not claim access to raw rows beyond summaries."},
+            {"role": "user", "content": f"Dataset summaries: {ctx}\n\nQuestion: {question}"},
+        ],
+        temperature=0.2,
+        max_tokens=500,
+    )
+    return response.choices[0].message.content or "I could not generate an answer."
+
+
+def markdown_to_html(report: str) -> str:
+    body_lines: list[str] = []
+    in_list = False
+    for line in report.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("- "):
+            if not in_list:
+                body_lines.append("<ul>")
+                in_list = True
+            body_lines.append(f"<li>{html.escape(stripped[2:])}</li>")
+            continue
+        if in_list:
+            body_lines.append("</ul>")
+            in_list = False
+        if stripped.startswith("# "):
+            body_lines.append(f"<h1>{html.escape(stripped[2:])}</h1>")
+        elif stripped.startswith("## "):
+            body_lines.append(f"<h2>{html.escape(stripped[3:])}</h2>")
+        elif stripped.startswith("### "):
+            body_lines.append(f"<h3>{html.escape(stripped[4:])}</h3>")
+        elif not stripped:
+            body_lines.append("<br>")
+        else:
+            body_lines.append(f"<p>{html.escape(stripped)}</p>")
+    if in_list:
+        body_lines.append("</ul>")
+    return """<!doctype html><html><head><meta charset='utf-8'><title>InsightForge Business Report</title><style>body{font-family:Arial,sans-serif;max-width:980px;margin:40px auto;line-height:1.55;color:#172033}h1,h2,h3{color:#0f4c81}table{border-collapse:collapse;width:100%}code,pre{background:#f5f7fb}</style></head><body>""" + "\n".join(body_lines) + "</body></html>"
+
+
+def build_business_report(df: pd.DataFrame, original_df: pd.DataFrame, cleaning_notes: list[str], test_results: list[str]) -> str:
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    st.session_state.report_generated_at = generated
+    findings = summarize_key_findings(df)
+    num_stats = numeric_descriptive_stats(df)
+    cat_stats = categorical_summary(df)
+    charts = recommended_story_charts(df)
+    ml_summary = st.session_state.get("ml_results", {}).get("summary", "No machine-learning model has been run during this session.")
+    missing_pct = safe_pct(df.isna().sum().sum(), df.shape[0] * df.shape[1])
+    lines = [
+        "# InsightForge Business Analysis Report",
+        f"Generated: {generated}",
+        "",
+        "## Dataset Overview",
+        f"The analysis uses the uploaded dataset after selected cleaning steps: {df.shape[0]:,} rows and {df.shape[1]:,} columns. The original upload contained {original_df.shape[0]:,} rows and {original_df.shape[1]:,} columns.",
+        "",
+        "## Data Quality Summary",
+        f"Missing values represent {missing_pct:.2f}% of cells. Duplicate rows total {int(df.duplicated().sum()):,}. Highest missing-value column: {findings['highest_missing_value_column']}.",
+        "",
+        "## Executive Summary",
+        storytelling_text(df, original_df, cleaning_notes),
+        "",
+        "## Key Findings",
+        f"- Strongest positive correlation: {findings['strongest_positive_correlation']}",
+        f"- Strongest negative correlation: {findings['strongest_negative_correlation']}",
+        f"- Most variable numeric column: {findings['most_variable_numeric_column']}",
+        f"- Most imbalanced categorical column: {findings['most_imbalanced_categorical_column']}",
+        "",
+        "## Descriptive Statistics Summary",
+        num_stats.head(12).to_markdown() if not num_stats.empty else "No numeric descriptive statistics are available.",
+        "",
+        "## Categorical Summary",
+        cat_stats.head(12).to_markdown() if not cat_stats.empty else "No categorical summary is available.",
+        "",
+        "## Important Visual Insights",
+    ]
+    lines.extend([f"- {title}: {caption}" for title, _, caption in charts] or ["No recommended visual insights could be generated from the detected data types."])
+    lines.extend([
+        "",
+        "## Statistical Test Results",
+        *(test_results[-10:] if test_results else ["No statistical tests have been recorded during this session."]),
+        "",
+        "## ML Model Results",
+        ml_summary,
+        "",
+        "## Recommended Next Steps",
+        "- Validate the strongest relationships against domain knowledge before presenting conclusions.",
+        "- Address missingness, duplicates, and imbalanced categories before high-stakes modeling.",
+        "- Run targeted statistical tests or ML models tied to a specific business or academic hypothesis.",
+        "- Re-run the report after selecting final cleaning settings and model configuration.",
+        "",
+        "## Limitations",
+        "- Results are based only on the uploaded dataset and selected in-app cleaning choices.",
+        "- Correlations and model importance do not prove causation.",
+        "- AI chat responses use summaries and metadata rather than the full raw dataset.",
+    ])
+    return "\n".join(lines)
+
 # -----------------------------------------------------------------------------
 # Visualization builder
 # -----------------------------------------------------------------------------
@@ -645,16 +1025,33 @@ def render_visualization(df: pd.DataFrame, chart_type: str, x_col: str | None, y
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="InsightForge Streamlit Analytics", page_icon="📊", layout="wide")
 st.title("📊 InsightForge Streamlit Data Analysis")
-st.caption("Upload CSV, Excel, or JSON files and generate real descriptive, inferential, modeling, visualization, and written analysis outputs.")
+st.caption("Upload CSV, Excel, or JSON files and generate real descriptive, inferential, modeling, visualization, ML, Q&A, and report outputs.")
 
 if "test_results" not in st.session_state:
     st.session_state.test_results = []
 if "regression_text" not in st.session_state:
     st.session_state.regression_text = ""
+if "ml_results" not in st.session_state:
+    st.session_state.ml_results = {}
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+if "report_generated_at" not in st.session_state:
+    st.session_state.report_generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 with st.sidebar:
+    st.caption("InsightForge Streamlit v2.0")
+    if st.button("Reset workflow", help="Clear chat, model results, reports, and cached interactive findings."):
+        st.session_state.test_results = []
+        st.session_state.regression_text = ""
+        st.session_state.ml_results = {}
+        st.session_state.chat_history = []
+        st.session_state.report_generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        st.rerun()
+
     st.header("1) Upload data")
     uploaded_file = st.file_uploader("Choose a CSV, XLSX, or JSON file", type=["csv", "xlsx", "json"])
+    if uploaded_file is not None:
+        st.success(f"Uploaded: {uploaded_file.name}")
 
     st.header("2) Dataset settings")
     sample_rows = st.slider("Sample rows to display", 5, 100, 20)
@@ -667,8 +1064,8 @@ with st.sidebar:
     st.header("3) Analysis sections")
     selected_sections = st.multiselect(
         "Show sections",
-        ["Dataset Overview", "Summary Analysis", "Descriptive Statistics", "Categorical Analysis", "Inferential Tests", "Regression Modeling", "Visualizations", "Export Report"],
-        default=["Dataset Overview", "Summary Analysis", "Descriptive Statistics", "Categorical Analysis", "Inferential Tests", "Regression Modeling", "Visualizations", "Export Report"],
+        ["Dataset Overview", "Storytelling Dashboard", "Summary Analysis", "Descriptive Statistics", "Categorical Analysis", "Inferential Tests", "Regression Modeling", "Machine Learning", "Visualizations", "Ask Your Data", "Export Report", "Business Report"],
+        default=["Dataset Overview", "Storytelling Dashboard", "Summary Analysis", "Descriptive Statistics", "Categorical Analysis", "Inferential Tests", "Regression Modeling", "Machine Learning", "Visualizations", "Ask Your Data", "Export Report", "Business Report"],
     )
 
     st.header("Theme/help notes")
@@ -694,23 +1091,31 @@ summary_text = generate_summary_analysis(df, original_df, cleaning_notes, st.ses
 
 (
     overview_tab,
+    story_tab,
     summary_tab,
     descriptive_tab,
     categorical_tab,
     inferential_tab,
     regression_tab,
+    ml_tab,
     visualization_tab,
+    ask_tab,
     export_tab,
+    business_report_tab,
 ) = st.tabs(
     [
         "Dataset Overview",
+        "Storytelling Dashboard",
         "Summary Analysis",
         "Descriptive Statistics",
         "Categorical Analysis",
         "Inferential Tests",
         "Regression Modeling",
+        "Machine Learning",
         "Visualizations",
+        "Ask Your Data",
         "Export Report",
+        "Business Report",
     ]
 )
 
@@ -752,6 +1157,52 @@ with overview_tab:
         st.dataframe(df.head(sample_rows), use_container_width=True)
     else:
         st.info("Dataset Overview is hidden by the sidebar section selector.")
+
+
+with story_tab:
+    if "Storytelling Dashboard" in selected_sections:
+        st.subheader("Storytelling Dashboard")
+        st.markdown("### Executive summary")
+        st.markdown(storytelling_text(df, original_df, cleaning_notes))
+
+        st.markdown("### KPI cards")
+        missing_pct = safe_pct(df.isna().sum().sum(), df.shape[0] * df.shape[1])
+        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        k1.metric("Rows", f"{df.shape[0]:,}")
+        k2.metric("Columns", f"{df.shape[1]:,}")
+        k3.metric("Missing %", f"{missing_pct:.1f}%")
+        k4.metric("Duplicates", f"{int(df.duplicated().sum()):,}")
+        k5.metric("Numeric", f"{len(numeric_cols):,}")
+        k6.metric("Categorical", f"{len(categorical_cols):,}")
+
+        st.markdown("### Key findings")
+        findings = summarize_key_findings(df)
+        cards = [
+            ("Strongest positive correlation", findings["strongest_positive_correlation"]),
+            ("Strongest negative correlation", findings["strongest_negative_correlation"]),
+            ("Most variable numeric column", findings["most_variable_numeric_column"]),
+            ("Most imbalanced categorical column", findings["most_imbalanced_categorical_column"]),
+            ("Highest missing-value column", findings["highest_missing_value_column"]),
+        ]
+        for row_start in range(0, len(cards), 3):
+            cols = st.columns(min(3, len(cards) - row_start))
+            for col_obj, (label, value) in zip(cols, cards[row_start: row_start + 3]):
+                with col_obj:
+                    st.info(f"**{label}**\n\n{value}")
+
+        st.markdown("### Recommended charts")
+        charts = recommended_story_charts(df)
+        if charts:
+            for title, fig, caption in charts:
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption(caption)
+        else:
+            st.info("Upload data with numeric or categorical columns to generate recommended charts.")
+
+        st.markdown("### Data Story")
+        st.markdown(storytelling_text(df, original_df, cleaning_notes))
+    else:
+        st.info("Storytelling Dashboard is hidden by the sidebar section selector.")
 
 with summary_tab:
     if "Summary Analysis" in selected_sections:
@@ -911,6 +1362,79 @@ with regression_tab:
     else:
         st.info("Regression Modeling is hidden by the sidebar section selector.")
 
+
+with ml_tab:
+    if "Machine Learning" in selected_sections:
+        st.subheader("Machine Learning")
+        if df.shape[1] < 2:
+            st.info("Machine learning requires at least one target and one predictor column.")
+        else:
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                ml_target = st.selectbox("Target column", df.columns.tolist(), key="ml_target")
+                ml_predictor_options = [col for col in df.columns if col != ml_target]
+                ml_predictors = st.multiselect("Predictor columns", ml_predictor_options, default=ml_predictor_options[: min(5, len(ml_predictor_options))], key="ml_predictors")
+                problem_type = st.radio("Problem type", ["auto-detect", "regression", "classification"], horizontal=False)
+                resolved_type = problem_type
+                if resolved_type == "auto-detect":
+                    resolved_type = "regression" if ml_target in numeric_cols and df[ml_target].nunique(dropna=True) > 10 else "classification"
+                model_options = ["Linear Regression", "Random Forest Regressor", "Decision Tree Regressor"] if resolved_type == "regression" else ["Logistic Regression", "Random Forest Classifier", "Decision Tree Classifier", "KNN Classifier"]
+                model_name = st.selectbox("Model", model_options)
+                test_size = st.slider("Test split", 0.1, 0.5, 0.25, 0.05)
+                random_state = st.number_input("Random seed", min_value=0, max_value=9999, value=42, step=1)
+                run_ml = st.button("Train model", type="primary")
+            with c2:
+                st.write("**Modeling notes**")
+                st.write("Categorical predictors are one-hot encoded, numeric predictors are imputed, and missing target rows are removed. Scaling is applied for Logistic Regression, KNN, and Linear Regression.")
+                st.write(f"Detected problem type: **{resolved_type}**")
+
+            if run_ml:
+                result = train_ml_model(df, ml_target, ml_predictors, problem_type, model_name, float(test_size), int(random_state))
+                if not result.get("valid"):
+                    st.warning(result["message"])
+                else:
+                    st.session_state.ml_results = {"raw": result, "summary": model_interpretation(result)}
+                    st.success("Model trained successfully.")
+
+            result = st.session_state.get("ml_results", {}).get("raw")
+            if result and result.get("valid"):
+                st.markdown("### Model results")
+                st.info(model_interpretation(result))
+                if result["problem_type"] == "regression":
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Model", result["model_name"])
+                    m2.metric("Train rows", f"{result['n_train']:,}")
+                    m3.metric("MAE", f"{result['mae']:.4g}")
+                    m4.metric("RMSE", f"{result['rmse']:.4g}")
+                    m5.metric("R²", f"{result['r2']:.4f}")
+                    pred_fig = px.scatter(result["predictions"], x="actual", y="predicted", title="Prediction vs Actual")
+                    min_val = float(np.nanmin([result["predictions"]["actual"].min(), result["predictions"]["predicted"].min()]))
+                    max_val = float(np.nanmax([result["predictions"]["actual"].max(), result["predictions"]["predicted"].max()]))
+                    pred_fig.add_shape(type="line", x0=min_val, x1=max_val, y0=min_val, y1=max_val, line=dict(dash="dash"))
+                    st.plotly_chart(pred_fig, use_container_width=True)
+                    resid_fig = px.scatter(result["predictions"], x="predicted", y="residual", title="Residual Plot")
+                    resid_fig.add_hline(y=0, line_dash="dash")
+                    st.plotly_chart(resid_fig, use_container_width=True)
+                else:
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Accuracy", f"{result['accuracy']:.4f}")
+                    m2.metric("Precision", f"{result['precision']:.4f}")
+                    m3.metric("Recall", f"{result['recall']:.4f}")
+                    m4.metric("F1", f"{result['f1']:.4f}")
+                    m5.metric("Test rows", f"{result['n_test']:,}")
+                    st.dataframe(result["confusion_matrix"], use_container_width=True)
+                    st.dataframe(result["classification_report"], use_container_width=True)
+                    if "roc" in result:
+                        roc_fig = px.line(result["roc"], x="fpr", y="tpr", title=f"ROC Curve (AUC={result['roc_auc']:.3f})")
+                        roc_fig.add_shape(type="line", x0=0, x1=1, y0=0, y1=1, line=dict(dash="dash"))
+                        st.plotly_chart(roc_fig, use_container_width=True)
+                if isinstance(result.get("feature_importance"), pd.DataFrame) and not result["feature_importance"].empty:
+                    st.markdown("### Feature importance")
+                    st.dataframe(result["feature_importance"].head(30), use_container_width=True)
+                    st.plotly_chart(px.bar(result["feature_importance"].head(15), x="importance", y="feature", orientation="h", title="Top feature importance"), use_container_width=True)
+    else:
+        st.info("Machine Learning is hidden by the sidebar section selector.")
+
 with visualization_tab:
     if "Visualizations" in selected_sections:
         st.subheader("Interactive visualization builder")
@@ -961,6 +1485,31 @@ with visualization_tab:
     else:
         st.info("Visualizations is hidden by the sidebar section selector.")
 
+
+with ask_tab:
+    if "Ask Your Data" in selected_sections:
+        st.subheader("Ask Your Data")
+        st.caption("Answers are based on uploaded data summaries, metadata, descriptive statistics, frequencies, correlations, and session model results — not the full raw dataset.")
+        for message in st.session_state.chat_history:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+        prompt = st.chat_input("Ask about columns, missing values, correlations, summary statistics, or model results")
+        if prompt:
+            st.session_state.chat_history.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            with st.chat_message("assistant"):
+                try:
+                    answer = answer_with_openai(prompt, df)
+                except Exception as exc:
+                    answer = f"I could not use the OpenAI API ({exc}). Falling back to dataset-summary rules.\n\n" + rule_based_answer(prompt, df)
+                st.markdown(answer)
+            st.session_state.chat_history.append({"role": "assistant", "content": answer})
+        with st.expander("Dataset summary used by chat"):
+            st.json(dataset_context(df))
+    else:
+        st.info("Ask Your Data is hidden by the sidebar section selector.")
+
 with export_tab:
     if "Export Report" in selected_sections:
         st.subheader("Export report and tables")
@@ -977,3 +1526,30 @@ with export_tab:
             st.markdown(report)
     else:
         st.info("Export Report is hidden by the sidebar section selector.")
+
+
+with business_report_tab:
+    if "Business Report" in selected_sections:
+        st.subheader("Business Report")
+        report = build_business_report(df, original_df, cleaning_notes, st.session_state.test_results)
+        html_report = markdown_to_html(report)
+        timestamp = st.session_state.report_generated_at.replace(":", "").replace(" ", "_")
+        st.caption(f"Timestamped report generation: {st.session_state.report_generated_at}")
+        st.download_button("Download Markdown business report", report.encode("utf-8"), f"business_report_{timestamp}.md", "text/markdown")
+        st.download_button("Download HTML business report", html_report.encode("utf-8"), f"business_report_{timestamp}.html", "text/html")
+        summary_tables = []
+        num_stats = numeric_descriptive_stats(df)
+        cat_stats = categorical_summary(df)
+        if not num_stats.empty:
+            summary_tables.append(num_stats.reset_index().assign(table="numeric_descriptive_statistics"))
+        if not cat_stats.empty:
+            summary_tables.append(cat_stats.reset_index().assign(table="categorical_summary"))
+        if summary_tables:
+            csv_summary = pd.concat(summary_tables, ignore_index=True, sort=False).to_csv(index=False)
+            st.download_button("Download CSV summary tables", csv_summary.encode("utf-8"), f"summary_tables_{timestamp}.csv", "text/csv")
+        with st.expander("Preview Markdown report", expanded=True):
+            st.markdown(report)
+        with st.expander("Preview HTML source"):
+            st.code(html_report[:8000], language="html")
+    else:
+        st.info("Business Report is hidden by the sidebar section selector.")
