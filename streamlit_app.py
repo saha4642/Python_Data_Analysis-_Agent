@@ -49,6 +49,16 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
+from ask_your_data_engine import (
+    AnalysisIntent,
+    AnalysisResult,
+    dataframe_metadata,
+    detect_analysis_intent,
+    needs_column_selection,
+    run_requested_analysis,
+    suggest_smart_actions,
+)
+
 
 ALPHA = 0.05
 MAX_DISTINCT_CATEGORIES = 60
@@ -1615,6 +1625,70 @@ def build_business_report(df: pd.DataFrame, original_df: pd.DataFrame, cleaning_
     ])
     return "\n".join(lines)
 
+
+# -----------------------------------------------------------------------------
+# Ask Your Data execution display helpers
+# -----------------------------------------------------------------------------
+def display_analysis_result(result: AnalysisResult, message_id: str | None = None, show_code: bool = False) -> None:
+    """Render a safe Ask Your Data analysis result in a consistent expert format."""
+    if result.warning:
+        st.info(result.warning)
+
+    if result.figures:
+        for index, fig in enumerate(result.figures):
+            st.plotly_chart(fig, use_container_width=True, key=f"{message_id}_fig_{index}" if message_id else None)
+
+    st.markdown(f"### {result.title}")
+    st.markdown("**What I did**")
+    st.write(result.what_i_did)
+
+    st.markdown("**Result**")
+    st.write(result.result_summary)
+    if result.metrics:
+        metric_items = list(result.metrics.items())[:8]
+        metric_cols = st.columns(min(4, max(1, len(metric_items))))
+        for idx, (label, value) in enumerate(metric_items):
+            if isinstance(value, float):
+                display_value = f"{value:.4g}"
+            else:
+                display_value = str(value)
+            metric_cols[idx % len(metric_cols)].metric(str(label), display_value)
+
+    for table_index, (title, table) in enumerate(result.tables):
+        if table is not None and not table.empty:
+            with st.expander(title, expanded=table_index == 0):
+                st.dataframe(table, use_container_width=True)
+
+    st.markdown("**Interpretation**")
+    st.write(result.interpretation)
+
+    st.markdown("**What to explore next**")
+    for item in result.next_steps:
+        st.markdown(f"- {item}")
+
+    if show_code and result.code:
+        st.code(result.code, language="python")
+
+
+def store_analysis_memory(question: str, detected: AnalysisIntent, result: AnalysisResult) -> None:
+    """Persist compact analysis memory for follow-up questions and reports."""
+    if "analysis_memory" not in st.session_state:
+        st.session_state.analysis_memory = []
+    st.session_state.analysis_memory.append(
+        {
+            "question": question,
+            "detected_intent": detected.intent,
+            "confidence": detected.confidence,
+            "selected_columns": result.selected_columns,
+            "result_summary": result.result_summary,
+            "interpretation": result.interpretation,
+            "table_titles": [title for title, _ in result.tables],
+            "chart_count": len(result.figures),
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+    )
+    st.session_state.analysis_memory = st.session_state.analysis_memory[-30:]
+
 # -----------------------------------------------------------------------------
 # Visualization builder
 # -----------------------------------------------------------------------------
@@ -1699,8 +1773,8 @@ with st.sidebar:
         st.session_state.chat_history = []
         st.session_state.pending_chat_prompt = None
         st.session_state.chat_dataset_signature = None
-        st.session_state.chart_history = []
         st.session_state.analysis_memory = []
+        st.session_state.chart_history = []
         st.session_state.report_generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         st.rerun()
 
@@ -2156,18 +2230,23 @@ with ask_tab:
     if "Ask Your Data" in selected_sections:
         st.subheader("Ask Your Data — AI Data Scientist Copilot")
         st.caption(
-            "A proactive exploratory analytics advisor that profiles your uploaded dataset, recommends analyses, "
-            "explains statistical meaning, and remembers this session's questions, charts, tests, and model discussions. "
-            "OpenAI is used only when OPENAI_API_KEY is available; otherwise the app uses computed rule-based analytics."
+            "Ask plain-English questions and I will run approved local analyses against the uploaded dataframe: "
+            "charts, statistical tests, models, tables, and expert interpretation. Python runs internally and is not shown unless you explicitly ask for code."
         )
 
         dataset_signature = (tuple(df.columns.astype(str).tolist()), int(df.shape[0]), int(df.shape[1]))
         if st.session_state.chat_dataset_signature != dataset_signature:
             auto_summary = generate_expert_intelligence_markdown(df)
             st.session_state.chat_history = [
-                {"id": "msg_auto_dataset_intelligence", "role": "assistant", "content": auto_summary}
+                {
+                    "id": "msg_auto_dataset_intelligence",
+                    "role": "assistant",
+                    "content": auto_summary,
+                    "analysis_result": None,
+                }
             ]
             st.session_state.pending_chat_prompt = None
+            st.session_state.pending_analysis_request = None
             st.session_state.chat_dataset_signature = dataset_signature
             st.session_state.analysis_memory = [{"type": "automatic_dataset_intelligence", "summary": auto_summary[:1500]}]
 
@@ -2191,8 +2270,10 @@ with ask_tab:
             st.warning("**Potential Risks**\n\n" + "\n".join(f"- {item}" for item in (risk_items or ["No major automated risk flags; still validate with visuals."])))
         with panel3:
             st.success(
-                "**Suggested Next Steps**\n\n"
-                + "\n".join(f"- {item}" for item in intelligence["business_questions"][:3])
+                "**What I can execute**\n\n"
+                "- Plotly visualizations\n"
+                "- Correlation, chi-square, t-test, ANOVA, Mann-Whitney, Kruskal-Wallis\n"
+                "- Regression/classification models and feature importance"
             )
 
         with st.expander("Automatic Dataset Intelligence Summary", expanded=True):
@@ -2205,75 +2286,103 @@ with ask_tab:
             c3.metric("Quality score", f"{intelligence['quality_score']}/100")
             c4.metric("Missing cells", f"{int(df.isna().sum().sum()):,}")
             st.write(
-                "The chat context includes dataframe shape, schema, missing-value reports, descriptive stats, "
-                "categorical frequencies, correlations with p-values, IQR outlier counts, skew/kurtosis flags, "
-                "multicollinearity checks, recommended tests/charts/ML strategies, prior chart history, and any regression/ML summaries created in this session. "
-                "It does not send the full raw dataset to OpenAI."
+                "The execution engine uses dataframe shape, schema, data types, missing-value reports, descriptive stats, "
+                "categorical frequencies, correlations, IQR outlier counts, and previous Ask Your Data results. "
+                "If OpenAI is configured, it may refine intent and narrative from metadata only; all calculations still run locally."
             )
 
-        st.markdown("**Suggested expert prompts:**")
-        suggestion_rows = [CHAT_SUGGESTIONS[:4], CHAT_SUGGESTIONS[4:8], CHAT_SUGGESTIONS[8:]]
-        for row_index, suggestions in enumerate(suggestion_rows):
-            cols = st.columns(len(suggestions))
-            for col, suggestion in zip(cols, suggestions):
-                if col.button(suggestion, key=f"ask_suggestion_{row_index}_{suggestion}"):
+        st.markdown("**Smart analysis buttons:**")
+        smart_actions = suggest_smart_actions(df)
+        for row_index in range(0, len(smart_actions), 4):
+            row_actions = smart_actions[row_index : row_index + 4]
+            cols = st.columns(len(row_actions))
+            for col, suggestion in zip(cols, row_actions):
+                if col.button(suggestion, key=f"ask_action_{row_index}_{suggestion}"):
                     st.session_state.pending_chat_prompt = suggestion
                     st.rerun()
 
-        chat_container = st.container(height=520, border=True)
+        chat_container = st.container(height=620, border=True)
         with chat_container:
             if not st.session_state.chat_history:
                 with st.chat_message("assistant"):
                     st.markdown(
-                        "Hi — I can analyze this uploaded dataset conversationally. "
-                        "Ask me for a summary, relationships, missing-value risks, outliers, visual ideas, or model interpretation."
+                        "Hi — ask for an analysis such as **Show correlation heatmap**, **Run ANOVA for G3 by school**, "
+                        "or **Build a regression model to predict G3 using G1, G2, studytime, failures, absences**."
                     )
             for message in st.session_state.chat_history:
                 with st.chat_message(message["role"]):
                     st.markdown(message["content"])
-                    if message.get("plot_code") and st.checkbox("Show generated chart code", key=f"show_code_{message['id']}"):
-                        st.code(message["plot_code"], language="python")
+                    if message.get("analysis_result"):
+                        display_analysis_result(message["analysis_result"], message_id=message["id"], show_code=message.get("show_code", False))
 
-        prompt = st.session_state.pending_chat_prompt or st.chat_input("Ask your AI data scientist about next analyses, tests, ML strategy, risks, visuals, or business implications…")
+        if "pending_analysis_request" not in st.session_state:
+            st.session_state.pending_analysis_request = None
+
+        if st.session_state.pending_analysis_request:
+            pending = st.session_state.pending_analysis_request
+            detected = pending["detected"]
+            missing = pending["missing"]
+            st.warning("I detected the analysis, but I need you to confirm one or more columns before I run it.")
+            with st.form("ask_column_confirmation"):
+                selected: dict[str, Any] = {}
+                if "numeric_columns" in missing:
+                    selected["columns"] = st.multiselect("Choose two numeric columns", missing["numeric_columns"], default=missing["numeric_columns"][:2], max_selections=2)
+                if "categorical_columns" in missing:
+                    selected["columns"] = st.multiselect("Choose two categorical columns", missing["categorical_columns"], default=missing["categorical_columns"][:2], max_selections=2)
+                if "numeric_column" in missing:
+                    value = st.selectbox("Choose numeric outcome/measure", missing["numeric_column"])
+                    selected.setdefault("columns", []).append(value)
+                if "group_column" in missing:
+                    value = st.selectbox("Choose grouping/category column", missing["group_column"])
+                    selected.setdefault("columns", []).append(value)
+                if "categorical_column" in missing:
+                    value = st.selectbox("Choose categorical column", missing["categorical_column"])
+                    selected.setdefault("columns", []).append(value)
+                if "target_column" in missing:
+                    default_target = "G3" if "G3" in missing["target_column"] else missing["target_column"][-1]
+                    selected["target"] = st.selectbox("Choose model target", missing["target_column"], index=missing["target_column"].index(default_target))
+                if "predictor_columns" in missing:
+                    predictor_options = [c for c in missing["predictor_columns"] if c != selected.get("target", detected.target)]
+                    selected["predictors"] = st.multiselect("Choose predictor columns", predictor_options, default=predictor_options[: min(5, len(predictor_options))])
+                run_now = st.form_submit_button("Run this analysis")
+                cancel = st.form_submit_button("Cancel")
+            if cancel:
+                st.session_state.pending_analysis_request = None
+                st.rerun()
+            if run_now:
+                question = pending["question"]
+                result = run_requested_analysis(detected, df, selected, question)
+                assistant_content = f"Detected intent: **{detected.intent}** (confidence {detected.confidence:.0%}). I ran the requested analysis locally."
+                message_id = f"msg_{len(st.session_state.chat_history)}"
+                st.session_state.chat_history.append({"id": message_id, "role": "assistant", "content": assistant_content, "analysis_result": result, "show_code": detected.needs_code})
+                store_analysis_memory(question, detected, result)
+                record_session_result(f"Ask Your Data — {question}: {result.result_summary}")
+                st.session_state.pending_analysis_request = None
+                st.rerun()
+
+        prompt = st.session_state.pending_chat_prompt or st.chat_input("Ask for a chart, test, model, quality check, or recommendation…")
         st.session_state.pending_chat_prompt = None
 
         if prompt:
-            user_message = {"id": f"msg_{len(st.session_state.chat_history)}", "role": "user", "content": prompt}
-            history_before_answer = st.session_state.chat_history.copy()
+            detected = detect_analysis_intent(prompt, df, dataframe_metadata(df))
+            user_message = {"id": f"msg_{len(st.session_state.chat_history)}", "role": "user", "content": prompt, "analysis_result": None}
             st.session_state.chat_history.append(user_message)
-
-            with st.chat_message("user"):
-                st.markdown(prompt)
-
-            with st.chat_message("assistant"):
-                try:
-                    answer = answer_with_openai(prompt, df, history_before_answer)
-                except Exception as exc:
-                    answer = (
-                        f"I could not use the OpenAI API ({exc}). Falling back to the local dataset-summary analyst.\n\n"
-                        + rule_based_answer(prompt, df, history_before_answer)
-                    )
-                chart_code = extract_python_code(answer)
-                clean_answer = strip_python_code(answer)
-                st.markdown(clean_answer)
-                saved_message: dict[str, Any] = {
-                    "id": f"msg_{len(st.session_state.chat_history)}",
-                    "role": "assistant",
-                    "content": clean_answer,
-                }
-                if chart_code:
-                    chart_code = sanitize_chat_plot_code(chart_code)
-                    fig, err = safe_exec_chat_plot(chart_code, df)
-                    saved_message["plot_code"] = chart_code
-                    if err:
-                        st.warning(f"I generated chart code, but Streamlit could not render it safely: {err}")
-                    elif fig is not None:
-                        st.pyplot(fig, clear_figure=True)
-                st.session_state.chat_history.append(saved_message)
+            missing = needs_column_selection(detected, df)
+            if missing:
+                st.session_state.pending_analysis_request = {"question": prompt, "detected": detected, "missing": missing}
+            else:
+                result = run_requested_analysis(detected, df, {}, prompt)
+                assistant_content = f"Detected intent: **{detected.intent}** (confidence {detected.confidence:.0%}). I ran the requested analysis locally."
+                if not result.valid:
+                    assistant_content = "I could not confidently run that request yet. Here is a safe clarification and examples based on your columns."
+                message_id = f"msg_{len(st.session_state.chat_history)}"
+                st.session_state.chat_history.append({"id": message_id, "role": "assistant", "content": assistant_content, "analysis_result": result, "show_code": detected.needs_code})
+                store_analysis_memory(prompt, detected, result)
+                record_session_result(f"Ask Your Data — {prompt}: {result.result_summary}")
             st.rerun()
 
-        with st.expander("Safe dataset summary used by chat"):
-            st.json(dataset_context(df))
+        with st.expander("Ask Your Data memory for this session"):
+            st.json(st.session_state.analysis_memory[-10:])
     else:
         st.info("Ask Your Data is hidden by the sidebar section selector.")
 

@@ -14,7 +14,7 @@ The Streamlit app remains the primary entry point for the Python data analysis e
 - **Descriptive and categorical analysis**: numeric descriptive statistics, categorical frequency tables, cross-tabs, and Chi-square analysis.
 - **Inferential statistics**: Pearson/Spearman correlations, t-test, ANOVA, Mann-Whitney U, and Kruskal-Wallis where data types support them.
 - **Machine Learning**: regression and classification workflows with one-hot encoding, missing-value imputation, train/test controls, metrics, plots, feature importance, and model interpretation.
-- **Ask Your Data**: chat-style Q&A over safe dataset summaries. Uses OpenAI when `OPENAI_API_KEY` is available and falls back to rule-based answers when it is not.
+- **Ask Your Data**: an execution-focused AI data scientist copilot. It detects natural-language requests, runs approved local analyses on the uploaded dataframe, renders Plotly charts/tables/statistical tests/models, explains results, remembers prior analyses, and uses OpenAI only for metadata-only intent/narrative help when `OPENAI_API_KEY` is available.
 - **Business Report**: generated Markdown and HTML reports with downloadable summary CSV tables and timestamped filenames.
 - **Collaboration-friendly session state**: reset button, persisted test/model/chat state, timestamped report generation, and a sidebar app version label.
 
@@ -64,6 +64,25 @@ export OPENAI_API_KEY="sk-your-key-here"
 
 The app sends only metadata, summary statistics, categorical summaries, correlations, and session model summaries to the API. It does not send the full raw dataset.
 
+## Ask Your Data examples
+
+The **Ask Your Data** tab supports plain-English analysis requests and does not show Python code unless you explicitly ask for it. Example prompts include:
+
+- `Show me a correlation heatmap`
+- `Make a scatter plot of G2 vs G3`
+- `Run Pearson correlation between G2 and G3`
+- `Run Spearman correlation between absences and G3`
+- `Show histogram of failures`
+- `Show boxplot of G3 by school`
+- `Run ANOVA for G3 by school`
+- `Run chi-square test between Fjob and Mjob`
+- `Build a regression model to predict G3 using G1, G2, studytime, failures, absences`
+- `Which features are most important for predicting G3?`
+- `Find outliers in absences`
+- `What should I explore next?`
+
+Supported Ask Your Data actions include summary/descriptive statistics, missing-value and data-quality reports, outlier detection, correlation ranking and heatmaps, scatter/regression/histogram/KDE/box/violin/bar/count/line/pie/stacked/area/scatter-matrix/3D charts, cross-tabulation, chi-square, t-test, ANOVA, Mann-Whitney U, Kruskal-Wallis, linear/logistic regression, random forest, decision tree, and feature-importance workflows. If a request is ambiguous, the app asks you to choose valid columns from the uploaded dataset instead of guessing or crashing.
+
 ## Streamlit Community Cloud deployment
 
 1. Push this repository to GitHub.
@@ -91,7 +110,7 @@ Use `student-mat.csv` from the UCI Student Performance dataset and verify:
 - **Storytelling Dashboard** shows key finding cards for correlations, variability, category imbalance, and missingness, plus chart captions.
 - **Machine Learning → regression** runs with `age` as target and `Medu`/`Fedu` as predictors.
 - **Machine Learning → classification** runs with `school` or `sex` as target.
-- **Ask Your Data** answers questions about columns, missing values, correlations, and summary statistics.
+- **Ask Your Data** executes the example prompts above, including charts, Pearson/Spearman correlations, ANOVA, chi-square, regression, feature importance, outliers, and next-step recommendations.
 - **Business Report** previews and downloads Markdown, HTML, and CSV summary tables.
 - The app starts with:
 
