@@ -825,35 +825,41 @@ def model_interpretation(result: dict[str, Any]) -> str:
 
 CHAT_SUGGESTIONS = [
     "Summarize this dataset",
+    "What variables are most important?",
+    "What should I analyze first?",
+    "What statistical tests do you recommend?",
+    "What ML model would work best?",
     "What are the strongest correlations?",
-    "Are there missing-value problems?",
-    "Which variables are most important?",
-    "What visualizations should I explore?",
-    "Explain this regression model",
-    "What trends stand out?",
+    "What anomalies do you see?",
+    "What visualizations should I generate?",
+    "How clean is this dataset?",
+    "Which variables are most predictive?",
+    "What business insights stand out?",
 ]
 
 CODE_BLOCK_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 IMPORT_LINE_RE = re.compile(r"^\s*(import\s+.+|from\s+.+\s+import\s+.+)\s*$", re.MULTILINE)
 FILE_IO_RE = re.compile(r"^\s*(open\(|to_csv\(|to_excel\(|savefig\(|plt\.savefig\().*$", re.MULTILINE)
 
-AI_DATA_CHAT_SYSTEM_PROMPT = """You are InsightForge's conversational data analyst.
-You answer questions about an uploaded pandas DataFrame called df using only the supplied safe summaries, small previews, computed findings, and session model outputs.
+AI_DATA_CHAT_SYSTEM_PROMPT = """You are InsightForge's senior AI data scientist, statistician, and business analytics advisor.
+You answer questions about an uploaded pandas DataFrame called df using only the supplied safe summaries, metadata, descriptive statistics, correlations, quality reports, outlier reports, chart/model summaries, and conversation memory. Never require or expose the full raw dataset.
 
-Behaviors to preserve from the original first-version chat app:
-- Sound like a helpful analyst in a real back-and-forth conversation.
-- Use the conversation history to answer follow-up questions such as "why?", "which one?", or "explain that".
-- Interpret the dataset naturally: summarize trends, relationships, anomalies, outliers, missing values, and practical next analyses.
-- Explain correlations, p-values, statistical significance, regression/model metrics, and feature importance in plain English.
-- Recommend useful visualizations when they would clarify the answer.
+Core behavior:
+- Do not behave like a passive chatbot. Actively guide exploration like a senior exploratory analytics copilot.
+- Explain what the dataset appears to represent, what matters first, why it matters, and what the user should do next.
+- Identify patterns, suspicious distributions, outliers, missingness, imbalance, multicollinearity, low-variance fields, leakage risks, and redundant predictors.
+- Recommend visualizations and explain what each chart may reveal.
+- Recommend statistical tests based on variable types, sample sizes, assumptions, and missingness; explain what significant and non-significant results would mean.
+- Recommend ML strategies, target variables, regression vs classification framing, baseline algorithms, validation strategy, feature importance interpretation, and overfitting/leakage risks.
+- Use conversation history for follow-ups such as "why?", "which one?", "what next?", or "explain that".
+- Sound like a professional analytics consultant: conversational, specific, connected, and action-oriented rather than generic.
 
 Safety and performance rules:
-- Do not claim to have the full raw dataset; only use the provided safe context.
+- Use only provided safe context; do not claim direct access to unsupplied raw rows.
 - Do not request or expose sensitive row-level data.
 - If you include plotting code, use matplotlib only, no imports, no file I/O, and end with plt.tight_layout().
-- Keep answers concise but conversational, with bullets when helpful.
+- Keep answers focused, but include enough reasoning for a user to learn what to do next.
 """
-
 
 def extract_python_code(text: str) -> str | None:
     """Extract one optional matplotlib code block from an AI response."""
@@ -961,6 +967,324 @@ def _categorical_frequencies(df: pd.DataFrame, limit_columns: int = 8, limit_val
     return output
 
 
+
+def _format_percent(value: float) -> str:
+    return f"{value:.1f}%"
+
+
+def _candidate_target_columns(df: pd.DataFrame, limit: int = 8) -> list[dict[str, Any]]:
+    """Heuristically identify columns that are plausible analytics/ML targets."""
+    types = infer_column_types(df)
+    signals = {
+        "target", "label", "outcome", "result", "score", "grade", "g3", "g2", "g1",
+        "price", "cost", "sales", "revenue", "profit", "churn", "default", "risk", "class",
+        "rating", "conversion", "success", "failure", "passed", "pass", "income", "amount",
+    }
+    candidates: list[dict[str, Any]] = []
+    for col in df.columns:
+        lower = str(col).lower()
+        score = 0
+        reasons: list[str] = []
+        if any(token in lower for token in signals):
+            score += 4
+            reasons.append("name looks outcome-oriented")
+        if lower in {"g3", "final", "final_grade", "final_score", "outcome", "target", "label"}:
+            score += 2
+            reasons.append("looks like a final outcome field")
+        if col in types.binary:
+            score += 3
+            reasons.append("binary target candidate")
+        if col in types.numeric:
+            non_missing = pd.to_numeric(df[col], errors="coerce").dropna()
+            if non_missing.nunique() >= 5:
+                score += 2
+                reasons.append("continuous numeric outcome candidate")
+            if non_missing.nunique() <= 20:
+                score += 1
+                reasons.append("bounded/ordinal numeric outcome candidate")
+        if col in types.categorical and df[col].nunique(dropna=True) <= 20:
+            score += 2
+            reasons.append("manageable categorical classes")
+        if str(col).lower() in {"id", "uuid", "name", "email"} or lower.endswith("id"):
+            score -= 5
+            reasons.append("identifier-like leakage risk")
+        if score > 0:
+            if col in types.binary or (col in types.categorical and df[col].nunique(dropna=True) <= 20):
+                problem = "classification"
+            elif col in types.numeric and df[col].nunique(dropna=True) <= 20:
+                problem = "regression or ordinal classification"
+            else:
+                problem = "regression"
+            candidates.append({"column": str(col), "score": score, "problem_type": problem, "why": "; ".join(reasons)})
+    return sorted(candidates, key=lambda row: row["score"], reverse=True)[:limit]
+
+
+def _skew_kurtosis_flags(df: pd.DataFrame, limit: int = 8) -> list[dict[str, Any]]:
+    flags: list[dict[str, Any]] = []
+    for col in df.select_dtypes(include=np.number).columns:
+        values = pd.to_numeric(df[col], errors="coerce").dropna()
+        if len(values) < 8 or values.nunique() <= 2:
+            continue
+        skew = float(values.skew())
+        kurt = float(values.kurtosis())
+        if abs(skew) >= 1 or abs(kurt) >= 3:
+            flags.append({"column": str(col), "skewness": round(skew, 3), "kurtosis": round(kurt, 3)})
+    return sorted(flags, key=lambda row: max(abs(row["skewness"]), abs(row["kurtosis"])), reverse=True)[:limit]
+
+
+def _low_variance_features(df: pd.DataFrame, limit: int = 8) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for col in df.columns:
+        non_missing = df[col].dropna()
+        if non_missing.empty:
+            rows.append({"column": str(col), "reason": "all values are missing"})
+            continue
+        top_share = float(non_missing.astype("object").value_counts(normalize=True).iloc[0] * 100)
+        if non_missing.nunique(dropna=True) <= 1 or top_share >= 95:
+            rows.append({"column": str(col), "reason": f"dominant value covers {top_share:.1f}% of non-missing rows"})
+    return rows[:limit]
+
+
+def _imbalance_flags(df: pd.DataFrame, limit: int = 8) -> list[dict[str, Any]]:
+    types = infer_column_types(df)
+    rows: list[dict[str, Any]] = []
+    for col in sorted(set(types.categorical + types.binary)):
+        counts = df[col].astype("object").value_counts(dropna=True)
+        if len(counts) < 2:
+            continue
+        top_share = float(counts.iloc[0] / counts.sum() * 100)
+        minority_share = float(counts.iloc[-1] / counts.sum() * 100)
+        if top_share >= 70 or minority_share <= 10:
+            rows.append({"column": str(col), "top_value": str(counts.index[0]), "top_percent": round(top_share, 1), "minority_percent": round(minority_share, 1)})
+    return sorted(rows, key=lambda row: row["top_percent"], reverse=True)[:limit]
+
+
+def _business_theme(df: pd.DataFrame) -> str:
+    cols = {str(c).lower() for c in df.columns}
+    joined = " ".join(cols)
+    if {"school", "sex", "age"}.issubset(cols) and ({"g1", "g2", "g3"} & cols):
+        return "student performance / educational outcomes"
+    if any(word in joined for word in ["sales", "revenue", "profit", "customer", "churn"]):
+        return "commercial performance, customer behavior, or revenue analytics"
+    if any(word in joined for word in ["patient", "diagnosis", "treatment", "medical", "health"]):
+        return "health or clinical outcomes analytics"
+    if any(word in joined for word in ["loan", "credit", "default", "risk", "income"]):
+        return "financial risk or credit analytics"
+    if any(word in joined for word in ["date", "time", "month", "year"]):
+        return "time-based operational or trend analytics"
+    return "general tabular business or research analytics"
+
+
+def build_dataset_intelligence(df: pd.DataFrame) -> dict[str, Any]:
+    """Compute the compact intelligence package behind the Ask Your Data copilot."""
+    types = infer_column_types(df)
+    missing_pct = (df.isna().mean() * 100).sort_values(ascending=False)
+    high_missing = [
+        {"column": str(col), "percent": round(float(pct), 1), "count": int(df[col].isna().sum())}
+        for col, pct in missing_pct.items()
+        if pct >= 20
+    ][:8]
+    correlations = _top_correlations(df, limit=12)
+    multicollinearity = [row for row in correlations if abs(row["pearson_r"]) >= 0.7]
+    outliers = _outlier_summary(df, limit=10)
+    skew_flags = _skew_kurtosis_flags(df)
+    imbalance = _imbalance_flags(df)
+    low_variance = _low_variance_features(df)
+    target_candidates = _candidate_target_columns(df)
+    duplicates = int(df.duplicated().sum())
+    total_cells = int(df.shape[0] * df.shape[1])
+    missing_total = int(df.isna().sum().sum())
+    quality_score = 100
+    quality_score -= min(35, missing_total / total_cells * 100 if total_cells else 0)
+    quality_score -= min(20, duplicates / len(df) * 100 if len(df) else 0)
+    quality_score -= min(20, len(high_missing) * 4)
+    quality_score -= min(15, len(outliers) * 2)
+    quality_score = max(0, round(quality_score, 1))
+
+    prediction_tasks: list[str] = []
+    for candidate in target_candidates[:5]:
+        prediction_tasks.append(f"Predict **{candidate['column']}** as a {candidate['problem_type']} task ({candidate['why']}).")
+    if not prediction_tasks and types.numeric:
+        prediction_tasks.append(f"Predict a high-value numeric field such as **{types.numeric[0]}** after confirming it is a real outcome, not an identifier.")
+
+    clustering = []
+    if len(types.numeric) >= 3:
+        clustering.append("Segment rows with standardized numeric features using k-means or hierarchical clustering, then profile clusters with categorical fields.")
+    if len(set(types.categorical + types.binary)) >= 2:
+        clustering.append("Use categorical profiles to identify meaningful segments, but one-hot encode carefully to avoid high-cardinality noise.")
+
+    return {
+        "theme": _business_theme(df),
+        "quality_score": quality_score,
+        "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
+        "type_counts": {"numeric": len(types.numeric), "categorical_binary": len(set(types.categorical + types.binary)), "datetime": len(types.datetime)},
+        "missing_total": missing_total,
+        "missing_percent": round(float(missing_total / total_cells * 100), 2) if total_cells else 0,
+        "high_missing": high_missing,
+        "duplicates": duplicates,
+        "strong_correlations": correlations[:8],
+        "multicollinearity": multicollinearity[:8],
+        "target_candidates": target_candidates,
+        "prediction_tasks": prediction_tasks,
+        "clustering_opportunities": clustering,
+        "imbalance_warnings": imbalance,
+        "outlier_heavy_columns": outliers,
+        "suspicious_distributions": skew_flags,
+        "low_variance_features": low_variance,
+        "visualization_recommendations": recommend_visualizations(df),
+        "statistical_recommendations": recommend_statistical_tests(df),
+        "ml_recommendations": recommend_ml_strategy(df),
+        "business_questions": likely_business_questions(df),
+        "next_steps": recommended_next_steps(df),
+    }
+
+
+def recommend_visualizations(df: pd.DataFrame) -> list[dict[str, str]]:
+    types = infer_column_types(df)
+    recs: list[dict[str, str]] = []
+    correlations = _top_correlations(df, limit=3)
+    skewed = _skew_kurtosis_flags(df, limit=3)
+    cat_cols = sorted(set(types.categorical + types.binary))
+    if len(types.numeric) >= 2:
+        recs.append({"chart": "Correlation heatmap", "why": "Quickly reveals redundant predictors, multicollinearity, and candidate relationships worth deeper testing."})
+    for row in correlations[:2]:
+        recs.append({"chart": f"Scatter plot with regression line: {row['left']} vs {row['right']}", "why": f"This is one of the strongest numeric relationships (r={row['pearson_r']:.3f}); the chart can reveal nonlinearity, clusters, and outliers."})
+    for row in skewed[:2]:
+        recs.append({"chart": f"Histogram + violin/boxplot for {row['column']}", "why": f"Skewness={row['skewness']:.2f} and kurtosis={row['kurtosis']:.2f}; distribution plots show whether transformations or robust tests are needed."})
+    if cat_cols:
+        recs.append({"chart": f"Grouped bar/count plot for {cat_cols[0]}", "why": "Shows category balance and possible sampling bias before comparing groups or training classifiers."})
+    if types.numeric and cat_cols:
+        recs.append({"chart": f"Box/violin plot of {types.numeric[0]} by {cat_cols[0]}", "why": "Compares distributions across groups and helps decide whether t-tests, ANOVA, or non-parametric tests are appropriate."})
+    if len(types.numeric) >= 4:
+        recs.append({"chart": "Pair plot / scatter-matrix of top numeric variables", "why": "Provides a compact view of multiple relationships before selecting model predictors."})
+    if types.datetime and types.numeric:
+        recs.append({"chart": f"Line chart of {types.numeric[0]} over {types.datetime[0]}", "why": "Checks trend, seasonality, and structural breaks over time."})
+    return recs[:8]
+
+
+def recommend_statistical_tests(df: pd.DataFrame) -> list[dict[str, str]]:
+    types = infer_column_types(df)
+    cat_cols = sorted(set(types.categorical + types.binary))
+    recs: list[dict[str, str]] = []
+    if len(types.numeric) >= 2:
+        corr = _top_correlations(df, limit=1)
+        if corr:
+            recs.append({"test": f"Pearson/Spearman correlation for {corr[0]['left']} and {corr[0]['right']}", "why": "Pearson tests linear association; Spearman is safer when variables are skewed, ordinal, or affected by outliers."})
+    if types.numeric and cat_cols:
+        group_col = cat_cols[0]
+        group_count = int(df[group_col].nunique(dropna=True))
+        if group_count == 2:
+            recs.append({"test": f"Welch t-test or Mann-Whitney U: {types.numeric[0]} by {group_col}", "why": "Use Welch t-test for two groups with unequal variances; use Mann-Whitney when distributions are non-normal or outlier-heavy."})
+        elif group_count > 2:
+            recs.append({"test": f"One-way ANOVA or Kruskal-Wallis: {types.numeric[0]} by {group_col}", "why": "ANOVA compares group means; Kruskal-Wallis is the robust alternative when normality or equal-variance assumptions are doubtful."})
+    if len(cat_cols) >= 2:
+        recs.append({"test": f"Chi-square test of independence: {cat_cols[0]} vs {cat_cols[1]}", "why": "Tests whether two categorical variables are associated; inspect expected cell counts and use grouped categories when cells are sparse."})
+    target_candidates = _candidate_target_columns(df)
+    if target_candidates:
+        target = target_candidates[0]["column"]
+        if target in types.numeric:
+            recs.append({"test": f"Multiple regression for {target}", "why": "Quantifies adjusted relationships, flags important predictors, and reveals multicollinearity/residual issues."})
+        else:
+            recs.append({"test": f"Logistic/classification analysis for {target}", "why": "Estimates predictive signal while monitoring class imbalance, leakage, and misclassification costs."})
+    return recs[:8]
+
+
+def recommend_ml_strategy(df: pd.DataFrame) -> list[str]:
+    types = infer_column_types(df)
+    candidates = _candidate_target_columns(df)
+    recs: list[str] = []
+    if candidates:
+        top = candidates[0]
+        if top["problem_type"].startswith("classification"):
+            recs.append(f"Start with interpretable logistic regression for **{top['column']}**, then compare a random forest for nonlinear interactions.")
+            recs.append("Use stratified train/test splitting and report weighted F1, recall by class, and a confusion matrix because class imbalance may hide poor minority-class performance.")
+        else:
+            recs.append(f"Start with linear regression or regularized regression for **{top['column']}**, then compare random forest regression for nonlinear effects.")
+            recs.append("Evaluate with MAE, RMSE, R², and residual plots; validate that influential predictors are available before the target is observed.")
+    elif types.numeric:
+        recs.append("Choose a domain-meaningful numeric target before modeling; avoid training on arbitrary columns just because they are numeric.")
+    if len(types.numeric) >= 3:
+        recs.append("Use clustering only after scaling numeric variables and removing identifiers; profile clusters after fitting rather than assuming they are meaningful.")
+    recs.append("Check leakage risks: IDs, post-outcome fields, duplicate rows, and near-perfect correlations can inflate model performance.")
+    recs.append("Use cross-validation for small datasets and keep preprocessing inside the sklearn Pipeline to avoid train/test contamination.")
+    return recs[:7]
+
+
+def likely_business_questions(df: pd.DataFrame) -> list[str]:
+    types = infer_column_types(df)
+    candidates = _candidate_target_columns(df)
+    questions: list[str] = []
+    theme = _business_theme(df)
+    if candidates:
+        target = candidates[0]["column"]
+        questions.append(f"What factors most strongly explain or predict **{target}** in this {theme} dataset?")
+        questions.append(f"Are there groups with systematically higher or lower **{target}**, and are those differences statistically meaningful?")
+    if _top_correlations(df, limit=1):
+        c = _top_correlations(df, limit=1)[0]
+        questions.append(f"Is the relationship between **{c['left']}** and **{c['right']}** practically meaningful or driven by outliers?")
+    if types.categorical or types.binary:
+        questions.append("Which categories dominate the data, and could that imbalance bias conclusions or model performance?")
+    if types.numeric:
+        questions.append("Which numeric variables show unusual distributions that require transformation, winsorization, or robust statistics?")
+    return questions[:6]
+
+
+def recommended_next_steps(df: pd.DataFrame) -> list[str]:
+    intelligence = {
+        "missing": bool(df.isna().sum().max() > 0),
+        "outliers": bool(_outlier_summary(df, limit=1)),
+        "correlations": bool(_top_correlations(df, limit=1)),
+        "targets": bool(_candidate_target_columns(df, limit=1)),
+    }
+    steps = ["Confirm the business/research objective and select a primary target variable before modeling."]
+    if intelligence["missing"]:
+        steps.append("Decide a missing-data strategy: impute, add missingness flags, or exclude unreliable columns depending on missingness mechanism.")
+    if intelligence["outliers"]:
+        steps.append("Inspect outlier-heavy columns with boxplots and determine whether unusual values are valid extremes, errors, or segment-specific behavior.")
+    if intelligence["correlations"]:
+        steps.append("Validate the strongest correlations with scatter plots and domain logic; correlation is not causation.")
+    if intelligence["targets"]:
+        steps.append("Run a baseline model with train/test validation, then inspect feature importance and leakage risks.")
+    steps.append("Translate findings into a short decision memo: what changed, why it matters, and what action should be taken next.")
+    return steps[:7]
+
+
+def generate_expert_intelligence_markdown(df: pd.DataFrame) -> str:
+    intel = build_dataset_intelligence(df)
+    lines = [
+        "## Automatic Dataset Intelligence Summary",
+        f"I read this as a **{intel['theme']}** dataset with **{intel['shape']['rows']:,} rows** and **{intel['shape']['columns']:,} columns**. It contains **{intel['type_counts']['numeric']} numeric**, **{intel['type_counts']['categorical_binary']} categorical/binary**, and **{intel['type_counts']['datetime']} datetime** fields.",
+        f"My initial data-quality score is **{intel['quality_score']}/100**. Missingness covers **{intel['missing_percent']:.2f}%** of cells and duplicate rows total **{intel['duplicates']:,}**.",
+        "",
+        "### What deserves attention first",
+    ]
+    if intel["target_candidates"]:
+        lines.append("- Potential target variables: " + "; ".join(f"**{row['column']}** ({row['problem_type']}: {row['why']})" for row in intel["target_candidates"][:4]) + ".")
+    else:
+        lines.append("- I do not see an obvious target variable yet; choose one based on the decision you want to support.")
+    if intel["strong_correlations"]:
+        lines.append("- Strongest relationships: " + "; ".join(f"**{r['left']} ↔ {r['right']}** (r={r['pearson_r']:.3f})" for r in intel["strong_correlations"][:4]) + ".")
+    if intel["high_missing"]:
+        lines.append("- High missingness: " + "; ".join(f"**{r['column']}** ({r['percent']:.1f}%)" for r in intel["high_missing"][:4]) + ".")
+    if intel["outlier_heavy_columns"]:
+        lines.append("- Outlier-heavy columns: " + "; ".join(f"**{r['column']}** ({r['percent']:.1f}% flagged)" for r in intel["outlier_heavy_columns"][:4]) + ".")
+    if intel["imbalance_warnings"]:
+        lines.append("- Imbalance warnings: " + "; ".join(f"**{r['column']}** dominated by {r['top_value']} ({r['top_percent']:.1f}%)" for r in intel["imbalance_warnings"][:4]) + ".")
+    if intel["suspicious_distributions"]:
+        lines.append("- Suspicious distributions: " + "; ".join(f"**{r['column']}** (skew={r['skewness']:.2f}, kurtosis={r['kurtosis']:.2f})" for r in intel["suspicious_distributions"][:4]) + ".")
+
+    sections = [
+        ("Recommended Next Analyses", intel["next_steps"]),
+        ("Visualization Intelligence", [f"{r['chart']} — {r['why']}" for r in intel["visualization_recommendations"]]),
+        ("Statistical Reasoning", [f"{r['test']} — {r['why']}" for r in intel["statistical_recommendations"]]),
+        ("ML Guidance", intel["ml_recommendations"]),
+        ("Likely Business Questions", intel["business_questions"]),
+    ]
+    for heading, items in sections:
+        lines.extend(["", f"### {heading}"])
+        lines.extend(f"- {item}" for item in (items or ["No automated recommendation is available for this dataset shape yet."]))
+    return "\n".join(lines)
+
 def dataset_context(df: pd.DataFrame) -> dict[str, Any]:
     """Build the safe, dataset-aware context used by OpenAI and fallback chat."""
     types = infer_column_types(df)
@@ -988,8 +1312,13 @@ def dataset_context(df: pd.DataFrame) -> dict[str, Any]:
         "categorical_frequencies": _categorical_frequencies(df),
         "top_correlations": _top_correlations(df),
         "outliers_iqr": _outlier_summary(df),
+        "advanced_intelligence": build_dataset_intelligence(df),
+        "visualization_recommendations": recommend_visualizations(df),
+        "statistical_test_recommendations": recommend_statistical_tests(df),
+        "ml_strategy_recommendations": recommend_ml_strategy(df),
         "key_findings": summarize_key_findings(df),
-        "small_sample_rows": _safe_records(df, rows=8),
+        "small_sample_rows": _safe_records(df, rows=5),
+        "chart_history": st.session_state.get("chart_history", [])[-8:],
         "regression_results": st.session_state.get("regression_text", "No regression model has been run yet."),
         "ml_results": st.session_state.get("ml_results", {}).get("summary", "No ML model has been run yet."),
     }
@@ -1043,20 +1372,13 @@ def _format_summary_answer(df: pd.DataFrame) -> str:
 
 
 def _format_visualization_answer(df: pd.DataFrame) -> str:
-    types = infer_column_types(df)
-    correlations = _top_correlations(df, limit=1)
-    ideas = ["- Use histograms and boxplots for numeric columns to inspect distribution shape and outliers."] if types.numeric else []
-    if correlations:
-        c = correlations[0]
-        ideas.append(f"- Use a scatter plot of **{c['left']}** vs **{c['right']}** because it is the strongest numeric relationship (r={c['pearson_r']:.3f}).")
-    if types.categorical or types.binary:
-        first_cat = sorted(set(types.categorical + types.binary))[0]
-        ideas.append(f"- Use a count/bar chart for **{first_cat}** to see category balance.")
-    if len(types.numeric) >= 2:
-        ideas.append("- Use the correlation heatmap to scan all numeric relationships at once.")
-    if types.datetime and types.numeric:
-        ideas.append(f"- Use a line chart over **{types.datetime[0]}** for key numeric measures to check trends over time.")
-    return "Recommended visualizations:\n" + "\n".join(ideas or ["- This dataset needs more typed columns before I can recommend specific automated charts."])
+    recs = recommend_visualizations(df)
+    if not recs:
+        return "I need more typed columns before I can make strong visualization recommendations. Start by checking schema and converting date/numeric-looking fields."
+    lines = ["Here are the visualizations I would generate first, in analyst priority order:"]
+    lines.extend(f"- **{row['chart']}**: {row['why']}" for row in recs)
+    lines.append("After creating each chart, ask: is the pattern strong, practically meaningful, potentially confounded, or driven by a small group of unusual rows?")
+    return "\n".join(lines)
 
 
 def _format_model_answer() -> str:
@@ -1066,19 +1388,89 @@ def _format_model_answer() -> str:
     return f"**Regression tab:** {regression_text}\n\n**Machine Learning tab:** {ml_text}\n\n{guidance}"
 
 
+
+def _format_statistical_recommendation_answer(df: pd.DataFrame) -> str:
+    recs = recommend_statistical_tests(df)
+    if not recs:
+        return "I need more typed variables before I can recommend meaningful tests. Add or convert numeric/categorical fields, then start with descriptive distributions."
+    lines = ["Here is the statistical testing plan I would use first:"]
+    lines.extend(f"- **{row['test']}**: {row['why']}" for row in recs)
+    lines.append("Before trusting p-values, check missingness, sample sizes per group, outliers, and whether observations are independent. Significant results mean the observed pattern is unlikely under the null hypothesis; they do not automatically imply causality or business importance.")
+    return "\n".join(lines)
+
+
+def _format_ml_strategy_answer(df: pd.DataFrame) -> str:
+    candidates = _candidate_target_columns(df)
+    lines = ["My ML guidance is to start simple, validate honestly, and watch for leakage."]
+    if candidates:
+        lines.append("Potential targets I would consider first:")
+        lines.extend(f"- **{row['column']}** → {row['problem_type']} ({row['why']})" for row in candidates[:5])
+    lines.append("Recommended strategy:")
+    lines.extend(f"- {item}" for item in recommend_ml_strategy(df))
+    return "\n".join(lines)
+
+
+def _format_anomaly_answer(df: pd.DataFrame) -> str:
+    intel = build_dataset_intelligence(df)
+    lines = ["Here are the main anomaly and risk signals I see:"]
+    if intel["outlier_heavy_columns"]:
+        lines.append("- **Outliers:** " + "; ".join(f"{r['column']} has {r['iqr_outlier_count']:,} IQR flags ({r['percent']:.1f}%)" for r in intel["outlier_heavy_columns"][:6]) + ".")
+    if intel["suspicious_distributions"]:
+        lines.append("- **Skew/kurtosis:** " + "; ".join(f"{r['column']} skew={r['skewness']:.2f}, kurtosis={r['kurtosis']:.2f}" for r in intel["suspicious_distributions"][:6]) + ".")
+    if intel["imbalance_warnings"]:
+        lines.append("- **Imbalance:** " + "; ".join(f"{r['column']} is dominated by {r['top_value']} ({r['top_percent']:.1f}%)" for r in intel["imbalance_warnings"][:6]) + ".")
+    if intel["multicollinearity"]:
+        lines.append("- **Multicollinearity:** " + "; ".join(f"{r['left']} vs {r['right']} r={r['pearson_r']:.3f}" for r in intel["multicollinearity"][:6]) + ".")
+    if intel["low_variance_features"]:
+        lines.append("- **Low-variance fields:** " + "; ".join(f"{r['column']} ({r['reason']})" for r in intel["low_variance_features"][:6]) + ".")
+    if len(lines) == 1:
+        lines.append("- I do not see major automated anomaly flags, but I would still verify distributions visually and check domain-specific validity rules.")
+    lines.append("Next action: visualize these fields before deleting anything. Some outliers are errors; others are exactly the high-value cases you want to understand.")
+    return "\n".join(lines)
+
+
+def _format_business_insights_answer(df: pd.DataFrame) -> str:
+    questions = likely_business_questions(df)
+    steps = recommended_next_steps(df)
+    lines = [f"I would frame this as **{_business_theme(df)}** and turn the exploration into these decision questions:"]
+    lines.extend(f"- {question}" for question in questions)
+    lines.append("Suggested consulting-style next steps:")
+    lines.extend(f"- {step}" for step in steps)
+    return "\n".join(lines)
+
+
+def _format_predictive_variables_answer(df: pd.DataFrame) -> str:
+    candidates = _candidate_target_columns(df)
+    correlations = _top_correlations(df, limit=8)
+    lines = ["For predictive work, I would separate likely **targets** from likely **predictors** and then verify with models."]
+    if candidates:
+        lines.append("Likely target variables:")
+        lines.extend(f"- **{row['column']}** ({row['problem_type']}): {row['why']}" for row in candidates[:5])
+    if correlations:
+        lines.append("Strong numeric predictor relationships to inspect first:")
+        lines.extend(f"- **{row['left']} ↔ {row['right']}**: r={row['pearson_r']:.3f}, p={row['p_value']:.3g}" for row in correlations[:6])
+    lines.append("Be careful: the most correlated variable may be leakage if it is measured after the target or is a near-duplicate of the outcome.")
+    return "\n".join(lines)
+
 def rule_based_answer(question: str, df: pd.DataFrame, history: list[dict[str, str]] | None = None) -> str:
     """Conversational fallback when OPENAI_API_KEY is unavailable or an API call fails."""
     q = question.lower()
     recent_context = " ".join(message.get("content", "").lower() for message in (history or [])[-4:])
     combined = f"{recent_context} {q}"
-    if any(word in combined for word in ["missing", "null", "na", "quality"]):
+    if any(word in combined for word in ["missing", "null", "na", "quality", "clean", "cleanliness"]):
         return _format_missing_answer(df)
     if any(word in combined for word in ["correlation", "relationship", "related", "association", "strongest"]):
         return _format_correlation_answer(df)
     if any(word in combined for word in ["visual", "chart", "plot", "graph"]):
         return _format_visualization_answer(df)
-    if any(word in combined for word in ["model", "regression", "p-value", "p value", "significance", "important", "importance", "predict"]):
-        return _format_model_answer()
+    if any(word in combined for word in ["statistical test", "t-test", "anova", "chi-square", "chi square", "p-value", "p value", "significance", "hypothesis"]):
+        return _format_statistical_recommendation_answer(df)
+    if any(word in combined for word in ["ml", "machine learning", "algorithm", "classifier", "classification", "train/test", "overfit"]):
+        return _format_ml_strategy_answer(df)
+    if any(word in combined for word in ["predictive", "predictor", "important variable", "variables are most important", "feature importance", "target"]):
+        return _format_predictive_variables_answer(df)
+    if any(word in combined for word in ["model", "regression", "important", "importance", "predict"]):
+        return _format_ml_strategy_answer(df)
     if any(word in combined for word in ["column", "field", "variable", "dtype", "type"]):
         types = infer_column_types(df)
         return (
@@ -1086,11 +1478,10 @@ def rule_based_answer(question: str, df: pd.DataFrame, history: list[dict[str, s
             f"Categorical/binary: {', '.join(sorted(set(types.categorical + types.binary))[:20]) or 'none'}. "
             f"Datetime: {', '.join(types.datetime[:10]) or 'none'}."
         )
-    if any(word in combined for word in ["outlier", "anomaly", "unusual"]):
-        outliers = _outlier_summary(df)
-        if not outliers:
-            return "Using the IQR rule, I do not see notable numeric outlier counts in the cleaned dataset. A boxplot is still useful for confirming distribution shape."
-        return "Potential anomalies by the IQR rule: " + "; ".join(f"**{row['column']}** has {row['iqr_outlier_count']:,} flagged rows ({row['percent']:.1f}%)" for row in outliers[:8]) + "."
+    if any(word in combined for word in ["outlier", "anomaly", "anomalies", "unusual", "risk", "suspicious", "skew", "kurtosis", "multicollinearity", "imbalance"]):
+        return _format_anomaly_answer(df)
+    if any(word in combined for word in ["business", "insight", "stand out", "decision", "advisor", "analyze first", "what should i analyze first"]):
+        return _format_business_insights_answer(df)
     if any(word in combined for word in ["categor", "frequency", "frequencies", "count", "distribution"]):
         freqs = _categorical_frequencies(df, limit_columns=5, limit_values=3)
         if not freqs:
@@ -1292,6 +1683,10 @@ if "pending_chat_prompt" not in st.session_state:
     st.session_state.pending_chat_prompt = None
 if "chat_dataset_signature" not in st.session_state:
     st.session_state.chat_dataset_signature = None
+if "chart_history" not in st.session_state:
+    st.session_state.chart_history = []
+if "analysis_memory" not in st.session_state:
+    st.session_state.analysis_memory = []
 if "report_generated_at" not in st.session_state:
     st.session_state.report_generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -1304,6 +1699,8 @@ with st.sidebar:
         st.session_state.chat_history = []
         st.session_state.pending_chat_prompt = None
         st.session_state.chat_dataset_signature = None
+        st.session_state.chart_history = []
+        st.session_state.analysis_memory = []
         st.session_state.report_generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         st.rerun()
 
@@ -1741,37 +2138,81 @@ with visualization_tab:
             st.warning("This chart needs different variable selections or more numeric columns.")
         else:
             st.plotly_chart(fig, use_container_width=True)
+            chart_record = {
+                "chart_type": chart_type,
+                "x": None if x_col == "None" else x_col,
+                "y": None if y_col == "None" else y_col,
+                "color": None if color_col == "None" else color_col,
+                "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            }
+            if chart_record not in st.session_state.chart_history:
+                st.session_state.chart_history.append(chart_record)
+                st.session_state.chart_history = st.session_state.chart_history[-12:]
     else:
         st.info("Visualizations is hidden by the sidebar section selector.")
 
 
 with ask_tab:
     if "Ask Your Data" in selected_sections:
-        st.subheader("Ask Your Data")
+        st.subheader("Ask Your Data — AI Data Scientist Copilot")
         st.caption(
-            "A conversational dataset analyst restored from the original chat workflow. "
-            "It uses chat memory plus safe dataset summaries, correlations, frequencies, model outputs, and small previews — never the full raw dataset."
+            "A proactive exploratory analytics advisor that profiles your uploaded dataset, recommends analyses, "
+            "explains statistical meaning, and remembers this session's questions, charts, tests, and model discussions. "
+            "OpenAI is used only when OPENAI_API_KEY is available; otherwise the app uses computed rule-based analytics."
         )
 
         dataset_signature = (tuple(df.columns.astype(str).tolist()), int(df.shape[0]), int(df.shape[1]))
         if st.session_state.chat_dataset_signature != dataset_signature:
-            st.session_state.chat_history = []
+            auto_summary = generate_expert_intelligence_markdown(df)
+            st.session_state.chat_history = [
+                {"id": "msg_auto_dataset_intelligence", "role": "assistant", "content": auto_summary}
+            ]
             st.session_state.pending_chat_prompt = None
             st.session_state.chat_dataset_signature = dataset_signature
+            st.session_state.analysis_memory = [{"type": "automatic_dataset_intelligence", "summary": auto_summary[:1500]}]
+
+        intelligence = build_dataset_intelligence(df)
+        panel1, panel2, panel3 = st.columns(3)
+        with panel1:
+            st.info(
+                "**Expert Recommendations**\n\n"
+                + "\n".join(f"- {step}" for step in intelligence["next_steps"][:3])
+            )
+        with panel2:
+            risk_items: list[str] = []
+            if intelligence["high_missing"]:
+                risk_items.append(f"High missingness in {intelligence['high_missing'][0]['column']} ({intelligence['high_missing'][0]['percent']:.1f}%).")
+            if intelligence["outlier_heavy_columns"]:
+                risk_items.append(f"Outliers in {intelligence['outlier_heavy_columns'][0]['column']} ({intelligence['outlier_heavy_columns'][0]['percent']:.1f}% flagged).")
+            if intelligence["imbalance_warnings"]:
+                risk_items.append(f"Imbalance in {intelligence['imbalance_warnings'][0]['column']} ({intelligence['imbalance_warnings'][0]['top_percent']:.1f}% top class).")
+            if intelligence["multicollinearity"]:
+                risk_items.append(f"Multicollinearity: {intelligence['multicollinearity'][0]['left']} vs {intelligence['multicollinearity'][0]['right']}.")
+            st.warning("**Potential Risks**\n\n" + "\n".join(f"- {item}" for item in (risk_items or ["No major automated risk flags; still validate with visuals."])))
+        with panel3:
+            st.success(
+                "**Suggested Next Steps**\n\n"
+                + "\n".join(f"- {item}" for item in intelligence["business_questions"][:3])
+            )
+
+        with st.expander("Automatic Dataset Intelligence Summary", expanded=True):
+            st.markdown(generate_expert_intelligence_markdown(df))
 
         with st.expander("What the assistant can use", expanded=False):
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Rows", f"{df.shape[0]:,}")
             c2.metric("Columns", f"{df.shape[1]:,}")
-            c3.metric("Numeric fields", f"{len(numeric_cols):,}")
+            c3.metric("Quality score", f"{intelligence['quality_score']}/100")
             c4.metric("Missing cells", f"{int(df.isna().sum().sum()):,}")
             st.write(
-                "The chat context includes dataframe shape, columns, dtypes, missing values, descriptive statistics, "
-                "categorical frequencies, correlations with p-values, IQR outlier counts, and any regression/ML summaries created in this session."
+                "The chat context includes dataframe shape, schema, missing-value reports, descriptive stats, "
+                "categorical frequencies, correlations with p-values, IQR outlier counts, skew/kurtosis flags, "
+                "multicollinearity checks, recommended tests/charts/ML strategies, prior chart history, and any regression/ML summaries created in this session. "
+                "It does not send the full raw dataset to OpenAI."
             )
 
-        st.markdown("**Try one of these prompts:**")
-        suggestion_rows = [CHAT_SUGGESTIONS[:4], CHAT_SUGGESTIONS[4:]]
+        st.markdown("**Suggested expert prompts:**")
+        suggestion_rows = [CHAT_SUGGESTIONS[:4], CHAT_SUGGESTIONS[4:8], CHAT_SUGGESTIONS[8:]]
         for row_index, suggestions in enumerate(suggestion_rows):
             cols = st.columns(len(suggestions))
             for col, suggestion in zip(cols, suggestions):
@@ -1793,7 +2234,7 @@ with ask_tab:
                     if message.get("plot_code") and st.checkbox("Show generated chart code", key=f"show_code_{message['id']}"):
                         st.code(message["plot_code"], language="python")
 
-        prompt = st.session_state.pending_chat_prompt or st.chat_input("Ask a follow-up about trends, correlations, missing values, visualizations, or model results…")
+        prompt = st.session_state.pending_chat_prompt or st.chat_input("Ask your AI data scientist about next analyses, tests, ML strategy, risks, visuals, or business implications…")
         st.session_state.pending_chat_prompt = None
 
         if prompt:
