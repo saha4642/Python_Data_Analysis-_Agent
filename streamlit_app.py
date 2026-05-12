@@ -67,6 +67,12 @@ ALPHA = 0.05
 MAX_DISTINCT_CATEGORIES = 60
 
 
+def chart_key_part(value: Any) -> str:
+    """Return a Streamlit-safe fragment for deterministic chart keys."""
+    cleaned = re.sub(r"[^a-zA-Z0-9_]+", "_", str(value)).strip("_").lower()
+    return cleaned or "chart"
+
+
 @dataclass(frozen=True)
 class ColumnTypes:
     numeric: list[str]
@@ -2072,7 +2078,7 @@ def display_analysis_result(result: AnalysisResult, message_id: str | None = Non
 
     if result.figures:
         for index, fig in enumerate(result.figures):
-            st.plotly_chart(fig, use_container_width=True, key=f"{message_id}_fig_{index}" if message_id else None)
+            st.plotly_chart(fig, use_container_width=True, key=f"analysis_result_{message_id or id(result)}_fig_{index}")
 
     st.markdown(f"### {result.title}")
     st.markdown("**What I did**")
@@ -2331,7 +2337,7 @@ with overview_tab:
             "unique_percent": df.nunique(dropna=True) / max(len(df), 1) * 100,
         }), use_container_width=True)
         if df.isna().sum().sum() > 0:
-            st.plotly_chart(missing_value_heatmap(df), use_container_width=True)
+            st.plotly_chart(missing_value_heatmap(df), use_container_width=True, key="overview_missing_value_heatmap")
             if len(df) > 1500:
                 st.caption("Missing-value heatmap uses a reproducible sample of 1,500 rows for performance.")
 
@@ -2398,8 +2404,8 @@ with story_tab:
 
         st.markdown("### Automatic best charts with captions")
         charts = recommended_story_charts(df)
-        for title, fig, caption in charts:
-            st.plotly_chart(fig, use_container_width=True)
+        for index, (title, fig, caption) in enumerate(charts):
+            st.plotly_chart(fig, use_container_width=True, key=f"story_auto_chart_{index}_{chart_key_part(title)}")
             st.markdown(f"**What this means:** {caption}")
             st.markdown("**Why it matters:** Use this chart to prioritize deeper tests, segmentation, or cleaning before decision-making.")
         if not charts:
@@ -2500,8 +2506,8 @@ with categorical_tab:
                     st.dataframe(result["observed"], use_container_width=True)
                     st.markdown("#### Row-normalized cross-tabulation (%)")
                     st.dataframe(result["normalized"], use_container_width=True)
-                    st.plotly_chart(px.bar(result["observed"].reset_index().melt(id_vars=col_a, var_name=col_b, value_name="count"), x=col_a, y="count", color=col_b, barmode="stack", title=f"Stacked bar: {col_a} by {col_b}"), use_container_width=True)
-                    st.plotly_chart(px.bar(result["observed"].reset_index().melt(id_vars=col_a, var_name=col_b, value_name="count"), x=col_a, y="count", color=col_b, barmode="group", title=f"Grouped bar: {col_a} by {col_b}"), use_container_width=True)
+                    st.plotly_chart(px.bar(result["observed"].reset_index().melt(id_vars=col_a, var_name=col_b, value_name="count"), x=col_a, y="count", color=col_b, barmode="stack", title=f"Stacked bar: {col_a} by {col_b}"), use_container_width=True, key="inferential_chi_square_stacked_bar")
+                    st.plotly_chart(px.bar(result["observed"].reset_index().melt(id_vars=col_a, var_name=col_b, value_name="count"), x=col_a, y="count", color=col_b, barmode="group", title=f"Grouped bar: {col_a} by {col_b}"), use_container_width=True, key="inferential_chi_square_grouped_bar")
                     st.markdown("#### Expected frequencies")
                     st.dataframe(result["expected"], use_container_width=True)
                     st.markdown("**Recommended follow-up:** Combine rare categories if expected counts are low, then segment key numeric outcomes by these groups or run a supervised model if one variable is a plausible target.")
@@ -2631,10 +2637,10 @@ with regression_tab:
                             min_val = float(np.nanmin([result["predictions"]["actual"].min(), result["predictions"]["predicted"].min()]))
                             max_val = float(np.nanmax([result["predictions"]["actual"].max(), result["predictions"]["predicted"].max()]))
                             pred_fig.add_shape(type="line", x0=min_val, x1=max_val, y0=min_val, y1=max_val, line=dict(dash="dash"))
-                            st.plotly_chart(pred_fig, use_container_width=True)
+                            st.plotly_chart(pred_fig, use_container_width=True, key="regression_prediction_vs_actual")
                             fig = px.scatter(result["predictions"], x="predicted", y="residual", trendline="ols", title="Residual Plot")
                             fig.add_hline(y=0, line_dash="dash")
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, use_container_width=True, key="regression_residual_plot")
                             st.markdown("**Interpretation:** Coefficients estimate the expected target change per one-unit predictor change, holding other included predictors constant. Use p-values as evidence strength, but rely on residual plots and validation before decisions.")
                             st.markdown("**Limitations and next steps:** Check nonlinearity, heteroskedasticity, multicollinearity, outliers, and leakage; compare against regularized or tree-based models.")
                             important = result["coefficients"].drop(index="const", errors="ignore").sort_values("coefficient", key=np.abs, ascending=False).head(3)
@@ -2654,7 +2660,7 @@ with regression_tab:
                             st.dataframe(result["classification_report"], use_container_width=True)
                             roc_fig = px.line(result["roc"], x="fpr", y="tpr", title="ROC Curve")
                             roc_fig.add_shape(type="line", x0=0, x1=1, y0=0, y1=1, line=dict(dash="dash"))
-                            st.plotly_chart(roc_fig, use_container_width=True)
+                            st.plotly_chart(roc_fig, use_container_width=True, key="classification_roc_curve")
                             st.markdown("**Interpretation:** Larger absolute logistic coefficients have stronger association with class odds after preprocessing. Validate with confusion matrix, ROC curve, and class-specific recall.")
                             st.markdown("**Limitations and next steps:** Check class imbalance, rare categories, leakage, calibration, and compare with tree-based classifiers.")
                             top_features = result["coefficients"].head(3)["feature"].tolist()
@@ -2728,10 +2734,10 @@ with ml_tab:
                     min_val = float(np.nanmin([result["predictions"]["actual"].min(), result["predictions"]["predicted"].min()]))
                     max_val = float(np.nanmax([result["predictions"]["actual"].max(), result["predictions"]["predicted"].max()]))
                     pred_fig.add_shape(type="line", x0=min_val, x1=max_val, y0=min_val, y1=max_val, line=dict(dash="dash"))
-                    st.plotly_chart(pred_fig, use_container_width=True)
+                    st.plotly_chart(pred_fig, use_container_width=True, key="ml_regression_prediction_vs_actual")
                     resid_fig = px.scatter(result["predictions"], x="predicted", y="residual", title="Residual Plot")
                     resid_fig.add_hline(y=0, line_dash="dash")
-                    st.plotly_chart(resid_fig, use_container_width=True)
+                    st.plotly_chart(resid_fig, use_container_width=True, key="ml_regression_residual_plot")
                 else:
                     m1, m2, m3, m4, m5 = st.columns(5)
                     m1.metric("Accuracy", f"{result['accuracy']:.4f}")
@@ -2744,11 +2750,11 @@ with ml_tab:
                     if "roc" in result:
                         roc_fig = px.line(result["roc"], x="fpr", y="tpr", title=f"ROC Curve (AUC={result['roc_auc']:.3f})")
                         roc_fig.add_shape(type="line", x0=0, x1=1, y0=0, y1=1, line=dict(dash="dash"))
-                        st.plotly_chart(roc_fig, use_container_width=True)
+                        st.plotly_chart(roc_fig, use_container_width=True, key="ml_classification_roc_curve")
                 if isinstance(result.get("feature_importance"), pd.DataFrame) and not result["feature_importance"].empty:
                     st.markdown("### Feature importance")
                     st.dataframe(result["feature_importance"].head(30), use_container_width=True)
-                    st.plotly_chart(px.bar(result["feature_importance"].head(15), x="importance", y="feature", orientation="h", title="Top feature importance"), use_container_width=True)
+                    st.plotly_chart(px.bar(result["feature_importance"].head(15), x="importance", y="feature", orientation="h", title="Top feature importance"), use_container_width=True, key="ml_feature_importance_bar")
                     st.markdown("**Expert recommendation:** Treat importance as model-specific association, not causation; confirm stability with permutation importance/cross-validation and domain review.")
     else:
         st.info("Machine Learning is hidden by the sidebar section selector.")
@@ -2759,8 +2765,8 @@ with visualization_tab:
         st.markdown("### Chart recommendation engine")
         st.dataframe(pd.DataFrame(recommend_visualizations(df)), use_container_width=True, hide_index=True)
         st.markdown("### Automatic best charts")
-        for title, auto_fig, caption in recommended_story_charts(df):
-            st.plotly_chart(auto_fig, use_container_width=True)
+        for index, (title, auto_fig, caption) in enumerate(recommended_story_charts(df)):
+            st.plotly_chart(auto_fig, use_container_width=True, key=f"visualization_auto_chart_{index}_{chart_key_part(title)}")
             st.markdown(f"**Caption:** {caption}")
             st.markdown(chart_explanation(title))
         chart_type = st.selectbox("Chart type", ["Histogram", "KDE/density plot", "Boxplot", "Violin plot", "Scatter plot", "Regression scatter plot", "Correlation heatmap", "Bar chart", "Count plot", "Grouped bar chart", "Line plot", "Pie chart", "Stacked bar chart", "Area chart", "Pair plot style scatter matrix", "3D scatter plot", "Missing-value heatmap", "Outlier plot", "Distribution comparison"])
@@ -2778,7 +2784,7 @@ with visualization_tab:
         if fig is None:
             st.warning("This chart needs different variable selections or more numeric columns.")
         else:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"visualization_custom_{chart_key_part(chart_type)}_{chart_key_part(x_col)}_{chart_key_part(y_col)}_{chart_key_part(color_col)}_{chart_key_part(agg)}")
             st.markdown(chart_explanation(chart_type, None if x_col == "None" else x_col, None if y_col == "None" else y_col))
             html_chart = fig.to_html(include_plotlyjs="cdn")
             st.download_button("Export chart as HTML", html_chart.encode("utf-8"), f"{chart_type.lower().replace(' ', '_')}.html", "text/html")
