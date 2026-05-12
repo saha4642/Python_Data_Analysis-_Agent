@@ -10,12 +10,15 @@ from __future__ import annotations
 import html
 import io
 import os
+import re
+import textwrap
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.figure_factory as ff
 import plotly.graph_objects as go
@@ -819,70 +822,320 @@ def model_interpretation(result: dict[str, Any]) -> str:
     return f"The {result['model_name']} model predicts {result['target']} with accuracy {result['accuracy']:.3f} and weighted F1 {result['f1']:.3f}. The most influential available predictors are {top}. Review class balance and confusion-matrix errors before acting on predictions."
 
 
-def dataset_context(df: pd.DataFrame) -> dict[str, Any]:
-    types = infer_column_types(df)
-    num_stats = numeric_descriptive_stats(df).round(4).head(20)
-    cat_stats = categorical_summary(df).round(4).head(20)
-    corr = df[types.numeric].corr(numeric_only=True).round(3).head(12).to_dict() if len(types.numeric) >= 2 else {}
-    return {
-        "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
-        "columns": df.columns.tolist(),
-        "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
-        "missing_values": df.isna().sum().astype(int).to_dict(),
-        "numeric_stats": num_stats.to_dict() if not num_stats.empty else {},
-        "categorical_summary": cat_stats.to_dict() if not cat_stats.empty else {},
-        "correlations": corr,
-        "model_results": st.session_state.get("ml_results", {}).get("summary", "No ML model has been run yet."),
+
+CHAT_SUGGESTIONS = [
+    "Summarize this dataset",
+    "What are the strongest correlations?",
+    "Are there missing-value problems?",
+    "Which variables are most important?",
+    "What visualizations should I explore?",
+    "Explain this regression model",
+    "What trends stand out?",
+]
+
+CODE_BLOCK_RE = re.compile(r"```(?:python)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+IMPORT_LINE_RE = re.compile(r"^\s*(import\s+.+|from\s+.+\s+import\s+.+)\s*$", re.MULTILINE)
+FILE_IO_RE = re.compile(r"^\s*(open\(|to_csv\(|to_excel\(|savefig\(|plt\.savefig\().*$", re.MULTILINE)
+
+AI_DATA_CHAT_SYSTEM_PROMPT = """You are InsightForge's conversational data analyst.
+You answer questions about an uploaded pandas DataFrame called df using only the supplied safe summaries, small previews, computed findings, and session model outputs.
+
+Behaviors to preserve from the original first-version chat app:
+- Sound like a helpful analyst in a real back-and-forth conversation.
+- Use the conversation history to answer follow-up questions such as "why?", "which one?", or "explain that".
+- Interpret the dataset naturally: summarize trends, relationships, anomalies, outliers, missing values, and practical next analyses.
+- Explain correlations, p-values, statistical significance, regression/model metrics, and feature importance in plain English.
+- Recommend useful visualizations when they would clarify the answer.
+
+Safety and performance rules:
+- Do not claim to have the full raw dataset; only use the provided safe context.
+- Do not request or expose sensitive row-level data.
+- If you include plotting code, use matplotlib only, no imports, no file I/O, and end with plt.tight_layout().
+- Keep answers concise but conversational, with bullets when helpful.
+"""
+
+
+def extract_python_code(text: str) -> str | None:
+    """Extract one optional matplotlib code block from an AI response."""
+    match = CODE_BLOCK_RE.search(text or "")
+    return match.group(1).strip() if match else None
+
+
+def strip_python_code(text: str) -> str:
+    """Remove code fences so the saved chat transcript stays readable."""
+    return re.sub(CODE_BLOCK_RE, "", text or "").strip()
+
+
+def sanitize_chat_plot_code(code: str) -> str:
+    """Remove imports/file I/O from generated plotting code before execution."""
+    cleaned = re.sub(IMPORT_LINE_RE, "", code or "")
+    cleaned = re.sub(FILE_IO_RE, "", cleaned)
+    cleaned = re.sub(r"^\s*plt\.show\(\)\s*$", "", cleaned, flags=re.MULTILINE)
+    if "plt.tight_layout" not in cleaned:
+        cleaned += "\n\nplt.tight_layout()"
+    return cleaned.strip()
+
+
+def safe_exec_chat_plot(code: str, df: pd.DataFrame) -> tuple[plt.Figure | None, str | None]:
+    """Safely execute limited matplotlib chart code against the in-memory dataframe."""
+    plt.close("all")
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    safe_globals: dict[str, Any] = {
+        "__builtins__": {
+            "abs": abs,
+            "min": min,
+            "max": max,
+            "sum": sum,
+            "len": len,
+            "range": range,
+            "sorted": sorted,
+            "enumerate": enumerate,
+            "print": print,
+            "round": round,
+        },
+        "df": df,
+        "pd": pd,
+        "np": np,
+        "plt": plt,
+        "fig": fig,
+        "ax": ax,
+        "textwrap": textwrap,
     }
-
-
-def rule_based_answer(question: str, df: pd.DataFrame) -> str:
-    q = question.lower()
-    ctx = dataset_context(df)
-    if any(word in q for word in ["column", "field", "variable"]):
-        return f"The dataset has {df.shape[1]:,} columns: " + ", ".join(df.columns.astype(str).tolist()[:40]) + ("..." if df.shape[1] > 40 else "")
-    if any(word in q for word in ["missing", "null", "na"]):
-        missing = df.isna().sum().sort_values(ascending=False)
-        top = missing[missing > 0].head(10)
-        if top.empty:
-            return "No missing values are present in the cleaned uploaded dataset."
-        return "Columns with the most missing values are: " + "; ".join(f"{col}: {int(val):,}" for col, val in top.items()) + "."
-    if any(word in q for word in ["correlation", "relationship", "related"]):
-        findings = summarize_key_findings(df)
-        return f"Strongest positive correlation: {findings['strongest_positive_correlation']}. Strongest negative correlation: {findings['strongest_negative_correlation']}."
-    if any(word in q for word in ["summary", "describe", "statistics", "mean", "median"]):
-        stats_df = numeric_descriptive_stats(df)
-        if stats_df.empty:
-            return "There are no numeric columns available for descriptive statistics."
-        cols = stats_df.head(8)
-        return "Numeric summary highlights: " + "; ".join(f"{idx} mean={row['mean']:.3g}, median={row['median']:.3g}" for idx, row in cols.iterrows()) + "."
-    if any(word in q for word in ["shape", "rows", "size"]):
-        return f"The cleaned uploaded dataset has {ctx['shape']['rows']:,} rows and {ctx['shape']['columns']:,} columns."
-    return "I can answer from dataset summaries. Try asking about columns, missing values, descriptive statistics, correlations, categories, or model results."
-
-
-def answer_with_openai(question: str, df: pd.DataFrame) -> str:
-    api_key = None
     try:
-        api_key = st.secrets.get("OPENAI_API_KEY", None)
+        exec(code, safe_globals, {})
+        return plt.gcf(), None
+    except Exception as exc:  # Keep the chat alive if generated chart code fails.
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _safe_records(frame: pd.DataFrame, rows: int = 8) -> list[dict[str, Any]]:
+    """Return a compact JSON-safe preview without shipping the full dataset."""
+    if frame.empty:
+        return []
+    preview = frame.head(rows).replace({np.nan: None})
+    return preview.to_dict(orient="records")
+
+
+def _top_correlations(df: pd.DataFrame, limit: int = 8) -> list[dict[str, Any]]:
+    numeric = df.select_dtypes(include=np.number)
+    if numeric.shape[1] < 2:
+        return []
+    rows: list[dict[str, Any]] = []
+    for i, left in enumerate(numeric.columns):
+        for right in numeric.columns[i + 1 :]:
+            pair = numeric[[left, right]].dropna()
+            if len(pair) >= 3 and pair[left].nunique() > 1 and pair[right].nunique() > 1:
+                r, p = stats.pearsonr(pair[left], pair[right])
+                rows.append(
+                    {
+                        "left": str(left),
+                        "right": str(right),
+                        "pearson_r": round(float(r), 4),
+                        "p_value": float(p),
+                        "n": int(len(pair)),
+                        "significant_at_0_05": bool(p < ALPHA),
+                    }
+                )
+    return sorted(rows, key=lambda row: abs(row["pearson_r"]), reverse=True)[:limit]
+
+
+def _outlier_summary(df: pd.DataFrame, limit: int = 8) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for col in df.select_dtypes(include=np.number).columns:
+        count = iqr_outlier_count(df[col])
+        if count:
+            rows.append({"column": str(col), "iqr_outlier_count": int(count), "percent": round(count / len(df) * 100, 2) if len(df) else 0})
+    return sorted(rows, key=lambda row: row["iqr_outlier_count"], reverse=True)[:limit]
+
+
+def _categorical_frequencies(df: pd.DataFrame, limit_columns: int = 8, limit_values: int = 5) -> dict[str, list[dict[str, Any]]]:
+    types = infer_column_types(df)
+    output: dict[str, list[dict[str, Any]]] = {}
+    for col in sorted(set(types.categorical + types.binary))[:limit_columns]:
+        table = frequency_table(df, col).head(limit_values)
+        output[str(col)] = [
+            {"value": str(idx), "count": int(row["count"]), "percent": round(float(row["percent"]), 2)}
+            for idx, row in table.iterrows()
+        ]
+    return output
+
+
+def dataset_context(df: pd.DataFrame) -> dict[str, Any]:
+    """Build the safe, dataset-aware context used by OpenAI and fallback chat."""
+    types = infer_column_types(df)
+    num_stats = numeric_descriptive_stats(df).round(4).head(30)
+    cat_stats = categorical_summary(df).round(4).head(30)
+    missing = df.isna().sum().sort_values(ascending=False)
+    missing_pct = (df.isna().mean() * 100).sort_values(ascending=False)
+    context: dict[str, Any] = {
+        "shape": {"rows": int(df.shape[0]), "columns": int(df.shape[1])},
+        "columns": df.columns.astype(str).tolist(),
+        "column_types": {
+            "numeric": types.numeric,
+            "categorical": sorted(set(types.categorical + types.binary)),
+            "datetime": types.datetime,
+            "binary": types.binary,
+        },
+        "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
+        "missing_values": {
+            str(col): {"count": int(missing.loc[col]), "percent": round(float(missing_pct.loc[col]), 2)}
+            for col in missing.index[:30]
+            if int(missing.loc[col]) > 0
+        },
+        "numeric_stats": num_stats.to_dict(orient="index") if not num_stats.empty else {},
+        "categorical_summary": cat_stats.to_dict(orient="index") if not cat_stats.empty else {},
+        "categorical_frequencies": _categorical_frequencies(df),
+        "top_correlations": _top_correlations(df),
+        "outliers_iqr": _outlier_summary(df),
+        "key_findings": summarize_key_findings(df),
+        "small_sample_rows": _safe_records(df, rows=8),
+        "regression_results": st.session_state.get("regression_text", "No regression model has been run yet."),
+        "ml_results": st.session_state.get("ml_results", {}).get("summary", "No ML model has been run yet."),
+    }
+    return context
+
+
+def _format_missing_answer(df: pd.DataFrame) -> str:
+    missing = df.isna().sum().sort_values(ascending=False)
+    top = missing[missing > 0].head(8)
+    if top.empty:
+        return "I do not see missing-value problems in the cleaned dataset — every column is complete after the selected cleaning settings."
+    lines = ["The main missing-value issues are:"]
+    for col, count in top.items():
+        lines.append(f"- **{col}**: {int(count):,} missing ({count / len(df) * 100:.1f}% of rows)")
+    lines.append("Columns above roughly 20–30% missingness usually need a deliberate decision: impute, create a missingness flag, or exclude from modeling if the field is not reliable.")
+    return "\n".join(lines)
+
+
+def _format_correlation_answer(df: pd.DataFrame) -> str:
+    correlations = _top_correlations(df)
+    if not correlations:
+        return "I need at least two numeric columns with enough non-missing variation to compute correlations, and this dataset does not currently meet that requirement."
+    lines = ["Here are the strongest Pearson correlations I found:"]
+    for row in correlations[:6]:
+        direction = "positive" if row["pearson_r"] >= 0 else "negative"
+        strength = "strong" if abs(row["pearson_r"]) >= 0.7 else "moderate" if abs(row["pearson_r"]) >= 0.4 else "weak"
+        sig = "statistically significant" if row["significant_at_0_05"] else "not statistically significant"
+        lines.append(f"- **{row['left']}** vs **{row['right']}**: r={row['pearson_r']:.3f} ({strength} {direction}), p={row['p_value']:.3g}, n={row['n']:,}; {sig} at α=0.05.")
+    lines.append("Remember: correlation shows association, not causation. A scatter plot is the next best check for shape, clusters, and outliers.")
+    return "\n".join(lines)
+
+
+def _format_summary_answer(df: pd.DataFrame) -> str:
+    types = infer_column_types(df)
+    findings = summarize_key_findings(df)
+    missing_total = int(df.isna().sum().sum())
+    outliers = _outlier_summary(df, limit=3)
+    lines = [
+        f"This cleaned dataset has **{df.shape[0]:,} rows** and **{df.shape[1]:,} columns**.",
+        f"I detected **{len(types.numeric)} numeric**, **{len(set(types.categorical + types.binary))} categorical/binary**, and **{len(types.datetime)} datetime** fields.",
+        f"Missing values remaining: **{missing_total:,}**.",
+        f"Strongest positive relationship: {findings['strongest_positive_correlation']}.",
+        f"Strongest negative relationship: {findings['strongest_negative_correlation']}.",
+        f"Most variable numeric field: {findings['most_variable_numeric_column']}.",
+        f"Most imbalanced categorical field: {findings['most_imbalanced_categorical_column']}.",
+    ]
+    if outliers:
+        lines.append("Potential outlier-heavy columns include " + ", ".join(f"**{row['column']}** ({row['iqr_outlier_count']:,})" for row in outliers) + ".")
+    lines.append("A good next step is to inspect distributions for high-variation fields and scatter plots for the strongest correlations.")
+    return "\n".join(lines)
+
+
+def _format_visualization_answer(df: pd.DataFrame) -> str:
+    types = infer_column_types(df)
+    correlations = _top_correlations(df, limit=1)
+    ideas = ["- Use histograms and boxplots for numeric columns to inspect distribution shape and outliers."] if types.numeric else []
+    if correlations:
+        c = correlations[0]
+        ideas.append(f"- Use a scatter plot of **{c['left']}** vs **{c['right']}** because it is the strongest numeric relationship (r={c['pearson_r']:.3f}).")
+    if types.categorical or types.binary:
+        first_cat = sorted(set(types.categorical + types.binary))[0]
+        ideas.append(f"- Use a count/bar chart for **{first_cat}** to see category balance.")
+    if len(types.numeric) >= 2:
+        ideas.append("- Use the correlation heatmap to scan all numeric relationships at once.")
+    if types.datetime and types.numeric:
+        ideas.append(f"- Use a line chart over **{types.datetime[0]}** for key numeric measures to check trends over time.")
+    return "Recommended visualizations:\n" + "\n".join(ideas or ["- This dataset needs more typed columns before I can recommend specific automated charts."])
+
+
+def _format_model_answer() -> str:
+    regression_text = st.session_state.get("regression_text") or "No regression model has been run yet."
+    ml_text = st.session_state.get("ml_results", {}).get("summary", "No ML model has been run yet.")
+    guidance = "For regression, focus on coefficient direction, p-values below 0.05 for statistical significance, R²/adjusted R² for explained variance, and residual plots for model assumptions. For ML, compare test-set metrics and feature importance before trusting predictions."
+    return f"**Regression tab:** {regression_text}\n\n**Machine Learning tab:** {ml_text}\n\n{guidance}"
+
+
+def rule_based_answer(question: str, df: pd.DataFrame, history: list[dict[str, str]] | None = None) -> str:
+    """Conversational fallback when OPENAI_API_KEY is unavailable or an API call fails."""
+    q = question.lower()
+    recent_context = " ".join(message.get("content", "").lower() for message in (history or [])[-4:])
+    combined = f"{recent_context} {q}"
+    if any(word in combined for word in ["missing", "null", "na", "quality"]):
+        return _format_missing_answer(df)
+    if any(word in combined for word in ["correlation", "relationship", "related", "association", "strongest"]):
+        return _format_correlation_answer(df)
+    if any(word in combined for word in ["visual", "chart", "plot", "graph"]):
+        return _format_visualization_answer(df)
+    if any(word in combined for word in ["model", "regression", "p-value", "p value", "significance", "important", "importance", "predict"]):
+        return _format_model_answer()
+    if any(word in combined for word in ["column", "field", "variable", "dtype", "type"]):
+        types = infer_column_types(df)
+        return (
+            f"The dataset has **{df.shape[1]:,} columns**. Numeric: {', '.join(types.numeric[:20]) or 'none'}. "
+            f"Categorical/binary: {', '.join(sorted(set(types.categorical + types.binary))[:20]) or 'none'}. "
+            f"Datetime: {', '.join(types.datetime[:10]) or 'none'}."
+        )
+    if any(word in combined for word in ["outlier", "anomaly", "unusual"]):
+        outliers = _outlier_summary(df)
+        if not outliers:
+            return "Using the IQR rule, I do not see notable numeric outlier counts in the cleaned dataset. A boxplot is still useful for confirming distribution shape."
+        return "Potential anomalies by the IQR rule: " + "; ".join(f"**{row['column']}** has {row['iqr_outlier_count']:,} flagged rows ({row['percent']:.1f}%)" for row in outliers[:8]) + "."
+    if any(word in combined for word in ["categor", "frequency", "frequencies", "count", "distribution"]):
+        freqs = _categorical_frequencies(df, limit_columns=5, limit_values=3)
+        if not freqs:
+            return "I do not see categorical columns to summarize with frequencies."
+        lines = ["Top categorical frequencies:"]
+        for col, values in freqs.items():
+            lines.append(f"- **{col}**: " + ", ".join(f"{v['value']} ({v['percent']:.1f}%)" for v in values))
+        return "\n".join(lines)
+    return _format_summary_answer(df)
+
+
+def _openai_api_key() -> str | None:
+    try:
+        key = st.secrets.get("OPENAI_API_KEY", None)
     except Exception:
-        api_key = None
-    api_key = api_key or os.getenv("OPENAI_API_KEY")
+        key = None
+    return (key or os.getenv("OPENAI_API_KEY") or "").strip() or None
+
+
+def answer_with_openai(question: str, df: pd.DataFrame, history: list[dict[str, str]] | None = None) -> str:
+    """Use OpenAI with conversation memory and compact dataset context; fallback if no key."""
+    api_key = _openai_api_key()
     if not api_key:
-        return rule_based_answer(question, df)
+        return rule_based_answer(question, df, history)
+
     client = OpenAI(api_key=api_key)
     ctx = dataset_context(df)
+    remembered_messages = [
+        {"role": message["role"], "content": message["content"]}
+        for message in (history or [])[-12:]
+        if message.get("role") in {"user", "assistant"} and message.get("content")
+    ]
+    messages = [
+        {"role": "system", "content": AI_DATA_CHAT_SYSTEM_PROMPT},
+        {"role": "system", "content": f"Safe dataset context (summaries only, not full raw data):\n{ctx}"},
+        *remembered_messages,
+        {"role": "user", "content": question},
+    ]
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "You answer questions about an uploaded dataset using only the supplied safe summaries. Do not claim access to raw rows beyond summaries."},
-            {"role": "user", "content": f"Dataset summaries: {ctx}\n\nQuestion: {question}"},
-        ],
-        temperature=0.2,
-        max_tokens=500,
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        messages=messages,
+        temperature=0.25,
+        max_tokens=800,
     )
     return response.choices[0].message.content or "I could not generate an answer."
-
 
 def markdown_to_html(report: str) -> str:
     body_lines: list[str] = []
@@ -1035,6 +1288,10 @@ if "ml_results" not in st.session_state:
     st.session_state.ml_results = {}
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "pending_chat_prompt" not in st.session_state:
+    st.session_state.pending_chat_prompt = None
+if "chat_dataset_signature" not in st.session_state:
+    st.session_state.chat_dataset_signature = None
 if "report_generated_at" not in st.session_state:
     st.session_state.report_generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -1045,6 +1302,8 @@ with st.sidebar:
         st.session_state.regression_text = ""
         st.session_state.ml_results = {}
         st.session_state.chat_history = []
+        st.session_state.pending_chat_prompt = None
+        st.session_state.chat_dataset_signature = None
         st.session_state.report_generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         st.rerun()
 
@@ -1489,23 +1748,90 @@ with visualization_tab:
 with ask_tab:
     if "Ask Your Data" in selected_sections:
         st.subheader("Ask Your Data")
-        st.caption("Answers are based on uploaded data summaries, metadata, descriptive statistics, frequencies, correlations, and session model results — not the full raw dataset.")
-        for message in st.session_state.chat_history:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-        prompt = st.chat_input("Ask about columns, missing values, correlations, summary statistics, or model results")
+        st.caption(
+            "A conversational dataset analyst restored from the original chat workflow. "
+            "It uses chat memory plus safe dataset summaries, correlations, frequencies, model outputs, and small previews — never the full raw dataset."
+        )
+
+        dataset_signature = (tuple(df.columns.astype(str).tolist()), int(df.shape[0]), int(df.shape[1]))
+        if st.session_state.chat_dataset_signature != dataset_signature:
+            st.session_state.chat_history = []
+            st.session_state.pending_chat_prompt = None
+            st.session_state.chat_dataset_signature = dataset_signature
+
+        with st.expander("What the assistant can use", expanded=False):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Rows", f"{df.shape[0]:,}")
+            c2.metric("Columns", f"{df.shape[1]:,}")
+            c3.metric("Numeric fields", f"{len(numeric_cols):,}")
+            c4.metric("Missing cells", f"{int(df.isna().sum().sum()):,}")
+            st.write(
+                "The chat context includes dataframe shape, columns, dtypes, missing values, descriptive statistics, "
+                "categorical frequencies, correlations with p-values, IQR outlier counts, and any regression/ML summaries created in this session."
+            )
+
+        st.markdown("**Try one of these prompts:**")
+        suggestion_rows = [CHAT_SUGGESTIONS[:4], CHAT_SUGGESTIONS[4:]]
+        for row_index, suggestions in enumerate(suggestion_rows):
+            cols = st.columns(len(suggestions))
+            for col, suggestion in zip(cols, suggestions):
+                if col.button(suggestion, key=f"ask_suggestion_{row_index}_{suggestion}"):
+                    st.session_state.pending_chat_prompt = suggestion
+                    st.rerun()
+
+        chat_container = st.container(height=520, border=True)
+        with chat_container:
+            if not st.session_state.chat_history:
+                with st.chat_message("assistant"):
+                    st.markdown(
+                        "Hi — I can analyze this uploaded dataset conversationally. "
+                        "Ask me for a summary, relationships, missing-value risks, outliers, visual ideas, or model interpretation."
+                    )
+            for message in st.session_state.chat_history:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+                    if message.get("plot_code") and st.checkbox("Show generated chart code", key=f"show_code_{message['id']}"):
+                        st.code(message["plot_code"], language="python")
+
+        prompt = st.session_state.pending_chat_prompt or st.chat_input("Ask a follow-up about trends, correlations, missing values, visualizations, or model results…")
+        st.session_state.pending_chat_prompt = None
+
         if prompt:
-            st.session_state.chat_history.append({"role": "user", "content": prompt})
+            user_message = {"id": f"msg_{len(st.session_state.chat_history)}", "role": "user", "content": prompt}
+            history_before_answer = st.session_state.chat_history.copy()
+            st.session_state.chat_history.append(user_message)
+
             with st.chat_message("user"):
                 st.markdown(prompt)
+
             with st.chat_message("assistant"):
                 try:
-                    answer = answer_with_openai(prompt, df)
+                    answer = answer_with_openai(prompt, df, history_before_answer)
                 except Exception as exc:
-                    answer = f"I could not use the OpenAI API ({exc}). Falling back to dataset-summary rules.\n\n" + rule_based_answer(prompt, df)
-                st.markdown(answer)
-            st.session_state.chat_history.append({"role": "assistant", "content": answer})
-        with st.expander("Dataset summary used by chat"):
+                    answer = (
+                        f"I could not use the OpenAI API ({exc}). Falling back to the local dataset-summary analyst.\n\n"
+                        + rule_based_answer(prompt, df, history_before_answer)
+                    )
+                chart_code = extract_python_code(answer)
+                clean_answer = strip_python_code(answer)
+                st.markdown(clean_answer)
+                saved_message: dict[str, Any] = {
+                    "id": f"msg_{len(st.session_state.chat_history)}",
+                    "role": "assistant",
+                    "content": clean_answer,
+                }
+                if chart_code:
+                    chart_code = sanitize_chat_plot_code(chart_code)
+                    fig, err = safe_exec_chat_plot(chart_code, df)
+                    saved_message["plot_code"] = chart_code
+                    if err:
+                        st.warning(f"I generated chart code, but Streamlit could not render it safely: {err}")
+                    elif fig is not None:
+                        st.pyplot(fig, clear_figure=True)
+                st.session_state.chat_history.append(saved_message)
+            st.rerun()
+
+        with st.expander("Safe dataset summary used by chat"):
             st.json(dataset_context(df))
     else:
         st.info("Ask Your Data is hidden by the sidebar section selector.")
