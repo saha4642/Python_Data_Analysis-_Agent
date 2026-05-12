@@ -29,8 +29,10 @@ from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from openai import OpenAI
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.svm import SVC, SVR
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.metrics import (
     accuracy_score,
@@ -45,9 +47,10 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 
 from ask_your_data_engine import (
     AnalysisIntent,
@@ -227,54 +230,18 @@ def clean_dataframe(
 
 @st.cache_data(show_spinner=False)
 def numeric_descriptive_stats(df: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict[str, Any]] = []
-    for col in df.select_dtypes(include=np.number).columns:
-        series = pd.to_numeric(df[col], errors="coerce")
-        non_missing = series.dropna()
-        mode = non_missing.mode()
-        q1, q3 = non_missing.quantile([0.25, 0.75]) if not non_missing.empty else (np.nan, np.nan)
-        rows.append(
-            {
-                "column": col,
-                "count": int(non_missing.count()),
-                "mean": non_missing.mean(),
-                "median": non_missing.median(),
-                "mode": mode.iloc[0] if not mode.empty else np.nan,
-                "std": non_missing.std(ddof=1),
-                "variance": non_missing.var(ddof=1),
-                "min": non_missing.min(),
-                "max": non_missing.max(),
-                "range": non_missing.max() - non_missing.min() if not non_missing.empty else np.nan,
-                "IQR": q3 - q1 if not non_missing.empty else np.nan,
-                "skewness": non_missing.skew(),
-                "kurtosis": non_missing.kurtosis(),
-                "missing_count": int(series.isna().sum()),
-                "missing_percent": float(series.isna().mean() * 100),
-            }
-        )
-    return pd.DataFrame(rows).set_index("column") if rows else pd.DataFrame()
+    """Backward-compatible numeric profile with expert-level diagnostics."""
+    return enhanced_numeric_descriptive_stats(df)
 
 
 @st.cache_data(show_spinner=False)
 def categorical_summary(df: pd.DataFrame) -> pd.DataFrame:
-    types = infer_column_types(df)
-    columns = sorted(set(types.categorical + types.binary))
-    rows: list[dict[str, Any]] = []
-    for col in columns:
-        counts = df[col].astype("object").value_counts(dropna=True)
-        top_value = counts.index[0] if not counts.empty else None
-        rows.append(
-            {
-                "column": col,
-                "unique_count": int(df[col].nunique(dropna=True)),
-                "top_value": top_value,
-                "top_count": int(counts.iloc[0]) if not counts.empty else 0,
-                "top_percent": float((counts.iloc[0] / len(df)) * 100) if len(df) and not counts.empty else 0,
-                "missing_count": int(df[col].isna().sum()),
-                "missing_percent": float(df[col].isna().mean() * 100),
-            }
-        )
-    return pd.DataFrame(rows).set_index("column") if rows else pd.DataFrame()
+    """Backward-compatible categorical profile with entropy and imbalance diagnostics."""
+    out = enhanced_categorical_summary(df)
+    if not out.empty and "top_percent" not in out.columns:
+        out = out.copy()
+        out["top_percent"] = out["top_value_percent"]
+    return out
 
 
 @st.cache_data(show_spinner=False)
@@ -295,6 +262,380 @@ def iqr_outlier_count(series: pd.Series) -> int:
     if iqr == 0 or pd.isna(iqr):
         return 0
     return int(((values < q1 - 1.5 * iqr) | (values > q3 + 1.5 * iqr)).sum())
+
+
+def iqr_outlier_bounds(series: pd.Series) -> tuple[float, float, float]:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.nunique() <= 2:
+        return np.nan, np.nan, np.nan
+    q1, q3 = values.quantile([0.25, 0.75])
+    iqr = q3 - q1
+    if iqr == 0 or pd.isna(iqr):
+        return np.nan, np.nan, np.nan
+    return float(q1 - 1.5 * iqr), float(q3 + 1.5 * iqr), float(iqr)
+
+
+def _entropy_from_counts(counts: pd.Series) -> float:
+    total = counts.sum()
+    if total == 0:
+        return 0.0
+    probs = counts / total
+    return float(-(probs * np.log2(probs + 1e-12)).sum())
+
+
+# -----------------------------------------------------------------------------
+# App-wide expert intelligence helpers
+# -----------------------------------------------------------------------------
+def detect_column_types(df: pd.DataFrame) -> ColumnTypes:
+    return infer_column_types(df)
+
+
+@st.cache_data(show_spinner=False)
+def enhanced_numeric_descriptive_stats(df: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for col in df.select_dtypes(include=np.number).columns:
+        series = pd.to_numeric(df[col], errors="coerce")
+        non_missing = series.dropna()
+        mode = non_missing.mode()
+        q1, q3 = non_missing.quantile([0.25, 0.75]) if not non_missing.empty else (np.nan, np.nan)
+        iqr = q3 - q1 if not non_missing.empty else np.nan
+        outliers = iqr_outlier_count(series)
+        mean = non_missing.mean() if not non_missing.empty else np.nan
+        std = non_missing.std(ddof=1) if len(non_missing) > 1 else np.nan
+        cv = float(std / abs(mean)) if pd.notna(std) and pd.notna(mean) and mean != 0 else np.nan
+        skew = non_missing.skew() if len(non_missing) > 2 else np.nan
+        kurt = non_missing.kurtosis() if len(non_missing) > 3 else np.nan
+        if len(non_missing) < 8:
+            normality = "Too few observations for a reliable normality hint"
+        elif pd.notna(skew) and abs(skew) < 0.5 and pd.notna(kurt) and abs(kurt) < 1:
+            normality = "Approximately symmetric; formal normality still requires a test"
+        elif pd.notna(skew) and abs(skew) >= 1:
+            normality = "Strong skew; consider transformation or robust/nonparametric methods"
+        else:
+            normality = "Some asymmetry/heavy tails possible; inspect histogram/Q-Q plot"
+        rows.append({
+            "column": col,
+            "count": int(non_missing.count()),
+            "mean": mean,
+            "median": non_missing.median() if not non_missing.empty else np.nan,
+            "mode": mode.iloc[0] if not mode.empty else np.nan,
+            "std": std,
+            "variance": non_missing.var(ddof=1) if len(non_missing) > 1 else np.nan,
+            "min": non_missing.min() if not non_missing.empty else np.nan,
+            "max": non_missing.max() if not non_missing.empty else np.nan,
+            "range": non_missing.max() - non_missing.min() if not non_missing.empty else np.nan,
+            "IQR": iqr,
+            "skewness": skew,
+            "kurtosis": kurt,
+            "missing_count": int(series.isna().sum()),
+            "missing_percent": float(series.isna().mean() * 100),
+            "outlier_count_iqr": int(outliers),
+            "outlier_percent_iqr": safe_pct(outliers, len(non_missing)),
+            "coefficient_of_variation": cv,
+            "normality_hint": normality,
+        })
+    return pd.DataFrame(rows).set_index("column") if rows else pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False)
+def enhanced_categorical_summary(df: pd.DataFrame) -> pd.DataFrame:
+    types = infer_column_types(df)
+    columns = sorted(set(types.categorical + types.binary))
+    rows: list[dict[str, Any]] = []
+    for col in columns:
+        counts = df[col].astype("object").value_counts(dropna=True)
+        unique = int(df[col].nunique(dropna=True))
+        top_count = int(counts.iloc[0]) if not counts.empty else 0
+        top_pct = safe_pct(top_count, len(df))
+        entropy = _entropy_from_counts(counts)
+        max_entropy = np.log2(unique) if unique > 1 else 0
+        concentration = float(1 - entropy / max_entropy) if max_entropy else 1.0
+        rows.append({
+            "column": col,
+            "unique_count": unique,
+            "top_value": counts.index[0] if not counts.empty else None,
+            "top_count": top_count,
+            "top_value_percent": top_pct,
+            "missing_count": int(df[col].isna().sum()),
+            "missing_percent": float(df[col].isna().mean() * 100),
+            "entropy": entropy,
+            "concentration_score": concentration,
+            "imbalance_warning": "High imbalance" if top_pct >= 70 else "Moderate imbalance" if top_pct >= 50 else "No major imbalance by top-share rule",
+            "cardinality_warning": "High cardinality" if unique > min(50, max(10, len(df) * 0.2)) else "OK",
+        })
+    return pd.DataFrame(rows).set_index("column") if rows else pd.DataFrame()
+
+
+def summarize_data_quality(df: pd.DataFrame, original_df: pd.DataFrame | None = None) -> dict[str, Any]:
+    types = infer_column_types(df)
+    missing_by_col = (df.isna().mean() * 100).sort_values(ascending=False)
+    unique_ratio = df.nunique(dropna=True) / max(len(df), 1)
+    high_cardinality = [c for c in df.columns if unique_ratio[c] >= 0.5 and df[c].nunique(dropna=True) > 20]
+    constant = [c for c in df.columns if df[c].nunique(dropna=True) <= 1]
+    near_constant = [c for c in df.columns if c not in constant and df[c].value_counts(normalize=True, dropna=True).head(1).sum() >= 0.95]
+    id_keywords = ("id", "uuid", "guid", "key", "code")
+    possible_ids = [c for c in df.columns if unique_ratio[c] >= 0.9 or any(k in c.lower() for k in id_keywords) and unique_ratio[c] >= 0.5]
+    leakage_keywords = ("final", "result", "outcome", "target", "label", "score", "grade", "post", "after", "future", "approved", "status")
+    leakage = [c for c in df.columns if any(k in c.lower() for k in leakage_keywords)]
+    target_suggestions = []
+    for c in df.columns:
+        nunique = df[c].nunique(dropna=True)
+        miss = df[c].isna().mean()
+        if c not in possible_ids and nunique > 1 and miss < 0.4:
+            if c in types.numeric and nunique > 5:
+                reason = "numeric outcome candidate for regression"
+            elif nunique <= 10 or c in types.binary:
+                reason = "class/segment candidate for classification"
+            else:
+                reason = "categorical outcome candidate; consider grouping rare levels"
+            score = (1 - miss) + min(nunique, 20) / 20
+            if any(k in c.lower() for k in leakage_keywords):
+                score += 0.4
+            target_suggestions.append({"column": c, "reason": reason, "missing_percent": miss * 100, "unique_count": int(nunique), "priority_score": round(score, 3)})
+    duplicate_rows = int(df.duplicated().sum())
+    missing_pct = safe_pct(df.isna().sum().sum(), df.shape[0] * df.shape[1])
+    outlier_cols = {c: iqr_outlier_count(df[c]) for c in types.numeric}
+    heavy_outliers = [c for c, n in outlier_cols.items() if safe_pct(n, df[c].notna().sum()) >= 5]
+    health = generate_dataset_health_score(df)
+    return {
+        "health_score": health,
+        "missing_pct": missing_pct,
+        "missing_by_col": missing_by_col,
+        "duplicate_rows": duplicate_rows,
+        "duplicate_percent": safe_pct(duplicate_rows, len(df)),
+        "memory_mb": float(df.memory_usage(deep=True).sum() / 1024**2),
+        "high_cardinality": high_cardinality,
+        "constant_columns": constant,
+        "near_constant_columns": near_constant,
+        "possible_id_columns": possible_ids,
+        "possible_targets": sorted(target_suggestions, key=lambda r: r["priority_score"], reverse=True)[:8],
+        "leakage_risk_columns": leakage,
+        "outlier_columns": outlier_cols,
+        "heavy_outlier_columns": heavy_outliers,
+        "types": types,
+    }
+
+
+def generate_dataset_health_score(df: pd.DataFrame) -> dict[str, Any]:
+    total_cells = df.shape[0] * df.shape[1]
+    missing_pct = safe_pct(df.isna().sum().sum(), total_cells)
+    duplicate_pct = safe_pct(df.duplicated().sum(), len(df))
+    types = infer_column_types(df)
+    unique_ratio = df.nunique(dropna=True) / max(len(df), 1)
+    constant_pct = safe_pct(sum(df[c].nunique(dropna=True) <= 1 for c in df.columns), df.shape[1])
+    high_card_pct = safe_pct(sum((unique_ratio >= 0.5) & (df.nunique(dropna=True) > 20)), df.shape[1])
+    outlier_pct = safe_pct(sum(iqr_outlier_count(df[c]) for c in types.numeric), max(sum(df[c].notna().sum() for c in types.numeric), 1))
+    score = 100 - min(35, missing_pct * 1.5) - min(20, duplicate_pct * 2) - min(15, constant_pct) - min(15, high_card_pct * 0.6) - min(15, outlier_pct * 1.2)
+    grade = "Excellent" if score >= 90 else "Good" if score >= 75 else "Needs review" if score >= 60 else "High risk"
+    return {"score": round(max(0, min(100, score)), 1), "grade": grade, "missing_pct": missing_pct, "duplicate_pct": duplicate_pct, "constant_pct": constant_pct, "high_cardinality_pct": high_card_pct, "outlier_pct": outlier_pct}
+
+
+def detect_outliers(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for col in infer_column_types(df).numeric:
+        lower, upper, iqr = iqr_outlier_bounds(df[col])
+        count = iqr_outlier_count(df[col])
+        rows.append({"column": col, "lower_bound": lower, "upper_bound": upper, "IQR": iqr, "outlier_count": count, "outlier_percent": safe_pct(count, df[col].notna().sum())})
+    return pd.DataFrame(rows).set_index("column") if rows else pd.DataFrame()
+
+
+def detect_skewness(df: pd.DataFrame) -> pd.DataFrame:
+    stats_df = enhanced_numeric_descriptive_stats(df)
+    return stats_df[["skewness", "normality_hint"]].sort_values("skewness", key=lambda s: s.abs(), ascending=False) if not stats_df.empty else pd.DataFrame()
+
+
+def detect_imbalanced_categories(df: pd.DataFrame) -> pd.DataFrame:
+    cat = enhanced_categorical_summary(df)
+    return cat[cat["top_value_percent"] >= 50].sort_values("top_value_percent", ascending=False) if not cat.empty else pd.DataFrame()
+
+
+def recommend_visualizations(df: pd.DataFrame) -> list[dict[str, str]]:
+    types = infer_column_types(df)
+    recs: list[dict[str, str]] = []
+    num_stats = enhanced_numeric_descriptive_stats(df)
+    cat_stats = enhanced_categorical_summary(df)
+    if not num_stats.empty:
+        spread_col = num_stats["std"].fillna(0).idxmax()
+        recs.append({"chart": "Histogram + box", "columns": spread_col, "reason": f"{spread_col} has the largest standard deviation; inspect distribution and outliers."})
+        out = num_stats.sort_values("outlier_percent_iqr", ascending=False).head(1)
+        if not out.empty and out.iloc[0]["outlier_count_iqr"] > 0:
+            recs.append({"chart": "Boxplot/outlier plot", "columns": out.index[0], "reason": f"IQR rule flags {int(out.iloc[0]['outlier_count_iqr'])} potential outliers."})
+    rel = compute_relationship_findings(df)
+    if rel.get("positive") or rel.get("negative"):
+        pair = max([p for p in [rel.get("positive"), rel.get("negative")] if p], key=lambda p: abs(p[2]))
+        recs.append({"chart": "Scatter + regression line", "columns": f"{pair[0]} vs {pair[1]}", "reason": f"Strongest numeric association has r={pair[2]:.3f}."})
+    if len(types.numeric) >= 2:
+        recs.append({"chart": "Correlation heatmap", "columns": ", ".join(types.numeric[:12]), "reason": "Compare numeric relationships and identify multicollinearity candidates."})
+    if not cat_stats.empty:
+        c = cat_stats.sort_values("top_value_percent", ascending=False).index[0]
+        recs.append({"chart": "Count/bar chart", "columns": c, "reason": f"Top category share is {cat_stats.loc[c, 'top_value_percent']:.1f}%; check imbalance."})
+    if types.datetime and types.numeric:
+        recs.append({"chart": "Line/area chart", "columns": f"{types.datetime[0]} and {types.numeric[0]}", "reason": "Datetime field exists; inspect trend, seasonality, and anomalies."})
+    if df.isna().sum().sum() > 0:
+        recs.append({"chart": "Missing-value heatmap", "columns": "all columns", "reason": "Missingness pattern may reveal systematic collection issues."})
+    return recs[:10]
+
+
+def recommend_statistical_tests(df: pd.DataFrame) -> list[dict[str, str]]:
+    types = infer_column_types(df)
+    recs = []
+    if len(types.numeric) >= 2:
+        recs.append({"test": "Pearson and Spearman correlation", "variables": f"{types.numeric[0]} and {types.numeric[1]}", "why": "Quantify linear and monotonic relationships between numeric variables."})
+    cats = sorted(set(types.categorical + types.binary))
+    if types.numeric and cats:
+        group = next((c for c in cats if 2 <= df[c].nunique(dropna=True) <= 10), cats[0])
+        n_groups = df[group].nunique(dropna=True)
+        recs.append({"test": "Welch t-test / Mann-Whitney U" if n_groups == 2 else "ANOVA / Kruskal-Wallis", "variables": f"{types.numeric[0]} by {group}", "why": "Compare numeric outcomes across groups with parametric and robust alternatives."})
+    if len(cats) >= 2:
+        recs.append({"test": "Chi-square test + Cramer's V", "variables": f"{cats[0]} × {cats[1]}", "why": "Assess whether categorical distributions are independent and measure association strength."})
+    return recs
+
+
+def recommend_ml_models(df: pd.DataFrame, target: str | None = None) -> list[str]:
+    if target is None:
+        q = summarize_data_quality(df)
+        target = q["possible_targets"][0]["column"] if q["possible_targets"] else (df.columns[-1] if len(df.columns) else None)
+    if target is None:
+        return ["Upload/select a target column before modeling."]
+    if target in infer_column_types(df).numeric and df[target].nunique(dropna=True) > 10:
+        return ["Linear Regression as an interpretable baseline", "Random Forest Regressor for nonlinear effects", "Decision Tree Regressor for explainable segmentation", "KNN/SVR only after scaling and validation"]
+    return ["Logistic Regression as an interpretable baseline", "Random Forest Classifier for nonlinear interactions", "Decision Tree Classifier for explainable rules", "KNN/SVM only after scaling and class-balance checks"]
+
+
+def generate_expert_interpretation(df: pd.DataFrame) -> list[str]:
+    q = summarize_data_quality(df)
+    lines = [f"Dataset health is {q['health_score']['grade']} ({q['health_score']['score']}/100) after penalizing missingness, duplicates, constant fields, high-cardinality fields, and IQR outliers."]
+    if q["missing_pct"] > 0:
+        top = q["missing_by_col"][q["missing_by_col"] > 0].head(3)
+        lines.append("Missingness is concentrated in " + ", ".join(f"{c} ({v:.1f}%)" for c, v in top.items()) + "; test whether missingness is random before imputing.")
+    if q["duplicate_rows"]:
+        lines.append(f"There are {q['duplicate_rows']:,} duplicate rows ({q['duplicate_percent']:.1f}%); decide if they are true repeat observations or ingestion duplicates.")
+    if q["high_cardinality"]:
+        lines.append("High-cardinality fields may be identifiers or sparse categories: " + ", ".join(q["high_cardinality"][:6]) + ".")
+    if q["constant_columns"] or q["near_constant_columns"]:
+        lines.append("Constant/near-constant columns add little analytical value and should usually be dropped before modeling.")
+    if q["heavy_outlier_columns"]:
+        lines.append("Outlier-heavy numeric fields need boxplots, domain validation, and robust statistics: " + ", ".join(q["heavy_outlier_columns"][:6]) + ".")
+    if q["leakage_risk_columns"]:
+        lines.append("Potential target/leakage-related names detected; exclude future/outcome fields from predictors unless justified: " + ", ".join(q["leakage_risk_columns"][:8]) + ".")
+    return lines
+
+
+def generate_next_steps(df: pd.DataFrame) -> list[str]:
+    q = summarize_data_quality(df)
+    steps = []
+    if q["missing_pct"] > 0:
+        steps.append("Profile missingness by key groups, then choose deletion, median/mode imputation, or model-based imputation based on mechanism and business impact.")
+    if q["duplicate_rows"] > 0:
+        steps.append("Review duplicate rows before final analysis; keep only if each row represents a valid repeated event.")
+    if q["possible_targets"]:
+        steps.append(f"Start modeling with candidate target **{q['possible_targets'][0]['column']}** and compare interpretable baseline models against tree-based models.")
+    steps.append("Validate the top correlation/association findings with domain knowledge and visualize them before making decisions.")
+    steps.append("Document limitations: observational data cannot prove causation, and model metrics require holdout or cross-validation evidence.")
+    return steps
+
+
+def generate_business_summary(df: pd.DataFrame) -> str:
+    findings = summarize_key_findings(df)
+    q = summarize_data_quality(df)
+    return (
+        f"The dataset is analytically usable with a {q['health_score']['grade'].lower()} health score of {q['health_score']['score']}/100. "
+        f"The strongest positive numeric relationship is {findings['strongest_positive_correlation']}; the strongest negative relationship is {findings['strongest_negative_correlation']}. "
+        f"Primary quality risks are {q['missing_pct']:.1f}% missing cells, {q['duplicate_rows']:,} duplicate rows, and {len(q['high_cardinality'])} high-cardinality fields. "
+        "Decision-makers should treat these as signals for prioritizing cleaning, focused hypothesis tests, and validated predictive models rather than as final causal claims."
+    )
+
+
+def missing_value_heatmap(df: pd.DataFrame, max_rows: int = 1500) -> go.Figure:
+    sample = df.sample(max_rows, random_state=42) if len(df) > max_rows else df
+    z = sample.isna().astype(int).T
+    fig = px.imshow(z, aspect="auto", color_continuous_scale=[[0, "#f7fbff"], [1, "#d62728"]], title="Missing-value heatmap (red = missing)")
+    fig.update_layout(xaxis_title="Sampled row index" if len(df) > max_rows else "Row index", yaxis_title="Column")
+    return fig
+
+
+def cramers_v_from_observed(observed: pd.DataFrame) -> float:
+    if observed.empty:
+        return np.nan
+    chi2, _, _, _ = stats.chi2_contingency(observed)
+    n = observed.to_numpy().sum()
+    r, k = observed.shape
+    denom = n * max(min(k - 1, r - 1), 1)
+    return float(np.sqrt(chi2 / denom)) if denom else np.nan
+
+
+def association_strength_text(v: float) -> str:
+    if pd.isna(v):
+        return "Association strength could not be calculated."
+    if v < 0.1:
+        return "negligible"
+    if v < 0.3:
+        return "weak"
+    if v < 0.5:
+        return "moderate"
+    return "strong"
+
+
+def categorical_pair_recommendations(df: pd.DataFrame, limit: int = 5) -> pd.DataFrame:
+    cats = [c for c in sorted(set(infer_column_types(df).categorical + infer_column_types(df).binary)) if 1 < df[c].nunique(dropna=True) <= MAX_DISTINCT_CATEGORIES]
+    rows = []
+    for i, a in enumerate(cats[:12]):
+        for b in cats[i + 1 : 12]:
+            observed = pd.crosstab(df[a], df[b])
+            if observed.shape[0] < 2 or observed.shape[1] < 2:
+                continue
+            v = cramers_v_from_observed(observed)
+            chi2, p, dof, expected = stats.chi2_contingency(observed)
+            rows.append({"first_column": a, "second_column": b, "cramers_v": v, "p_value": p, "min_expected_frequency": float(np.min(expected)), "recommendation_reason": f"Cramer's V={v:.3f} ({association_strength_text(v)}), p={p:.3g}"})
+    return pd.DataFrame(rows).sort_values(["cramers_v", "p_value"], ascending=[False, True]).head(limit) if rows else pd.DataFrame()
+
+
+def statistical_assumption_checks(df: pd.DataFrame, numeric_col: str, group_col: str | None = None) -> dict[str, Any]:
+    series = pd.to_numeric(df[numeric_col], errors="coerce").dropna()
+    normality = "At least 8 observations are needed for a useful normality check."
+    if len(series) >= 8:
+        sample = series.sample(min(len(series), 5000), random_state=42) if len(series) > 5000 else series
+        stat, p = stats.normaltest(sample) if len(sample) >= 20 else stats.shapiro(sample)
+        normality = f"Normality check p={p:.4g}; {'no strong departure detected' if p >= ALPHA else 'non-normality is likely'} (sample n={len(sample):,})."
+    out = {"normality": normality, "sample_size": int(len(series))}
+    if group_col:
+        subset = df[[numeric_col, group_col]].dropna()
+        groups = [pd.to_numeric(g[numeric_col], errors="coerce").dropna() for _, g in subset.groupby(group_col)]
+        groups = [g for g in groups if len(g) > 1]
+        out["group_sizes"] = {str(name): int(len(g[numeric_col].dropna())) for name, g in subset.groupby(group_col)}
+        if len(groups) >= 2:
+            lev_stat, lev_p = stats.levene(*groups)
+            out["equal_variance"] = f"Levene p={lev_p:.4g}; {'equal variance is plausible' if lev_p >= ALPHA else 'variance differs across groups'}."
+    return out
+
+
+def vif_table(df: pd.DataFrame, predictors: list[str]) -> pd.DataFrame:
+    numeric_predictors = [c for c in predictors if pd.api.types.is_numeric_dtype(df[c])]
+    if len(numeric_predictors) < 2:
+        return pd.DataFrame()
+    x = df[numeric_predictors].apply(pd.to_numeric, errors="coerce").dropna()
+    if len(x) < len(numeric_predictors) + 2:
+        return pd.DataFrame()
+    x_const = sm.add_constant(x, has_constant="add")
+    rows = []
+    for i, col in enumerate(x_const.columns):
+        if col == "const":
+            continue
+        try:
+            vif = variance_inflation_factor(x_const.values, i)
+        except Exception:
+            vif = np.nan
+        rows.append({"feature": col, "VIF": float(vif), "interpretation": "High multicollinearity" if pd.notna(vif) and vif >= 10 else "Moderate" if pd.notna(vif) and vif >= 5 else "OK"})
+    return pd.DataFrame(rows).sort_values("VIF", ascending=False)
+
+
+def chart_explanation(chart_type: str, x_col: str | None = None, y_col: str | None = None) -> str:
+    subject = " and ".join([c for c in [x_col, y_col] if c]) or "the selected columns"
+    return (
+        f"**What it shows:** This {chart_type.lower()} summarizes {subject} using the uploaded data.\n\n"
+        f"**Why it matters:** It helps reveal distribution shape, group differences, relationships, or data-quality issues that raw tables hide.\n\n"
+        "**What to check next:** Validate unusual patterns with filters, missingness checks, outlier review, and an appropriate statistical test or model."
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -326,6 +667,14 @@ def chi_square_analysis(df: pd.DataFrame, col_a: str, col_b: str) -> dict[str, A
         return {"valid": False, "message": "Chi-square requires at least two categories in each selected column."}
     chi2, p_value, dof, expected = stats.chi2_contingency(observed)
     expected_df = pd.DataFrame(expected, index=observed.index, columns=observed.columns)
+    cramer_v = cramers_v_from_observed(observed)
+    sparse_cells = int((observed <= 1).sum().sum())
+    low_expected = int((expected_df < 5).sum().sum())
+    warnings = []
+    if low_expected:
+        warnings.append(f"{low_expected} expected cell(s) are below 5; Chi-square assumptions may be weak. Consider combining rare levels or Fisher/exact methods for small tables.")
+    if sparse_cells:
+        warnings.append(f"{sparse_cells} observed cell(s) have 0 or 1 rows; sparse categories can make association estimates unstable.")
     return {
         "valid": True,
         "observed": observed,
@@ -334,6 +683,11 @@ def chi_square_analysis(df: pd.DataFrame, col_a: str, col_b: str) -> dict[str, A
         "p_value": float(p_value),
         "dof": int(dof),
         "expected": expected_df,
+        "cramers_v": float(cramer_v),
+        "association_strength": association_strength_text(cramer_v),
+        "low_expected_cells": low_expected,
+        "sparse_cells": sparse_cells,
+        "warnings": warnings,
         "interpretation": significance_text(float(p_value)),
     }
 
@@ -574,14 +928,37 @@ def generate_summary_analysis(df: pd.DataFrame, original_df: pd.DataFrame, clean
     lines.extend(["", "### Modeling Findings"])
     lines.append(regression_summary or "- Run a model in the Regression Modeling tab to add performance and predictor findings here. Numeric targets use OLS; binary targets use logistic regression.")
 
+    q = summarize_data_quality(df, original_df)
+    lines.extend(["", "### Data-Quality Concerns and Cleaning Actions"])
+    for item in generate_expert_interpretation(df):
+        lines.append(f"- {item}")
+    cleaning_actions = []
+    if q["missing_pct"] > 0:
+        cleaning_actions.append("Audit missingness patterns and impute only after deciding whether missingness is random, structural, or outcome-related.")
+    if q["possible_id_columns"]:
+        cleaning_actions.append("Exclude likely ID fields from modeling unless they represent meaningful grouped effects: " + ", ".join(q["possible_id_columns"][:6]) + ".")
+    if q["constant_columns"] or q["near_constant_columns"]:
+        cleaning_actions.append("Drop constant or near-constant predictors before statistical testing/modeling.")
+    lines.extend(f"- {action}" for action in (cleaning_actions or ["No urgent cleaning action was detected, but validate data definitions before final reporting."]))
+
+    lines.extend(["", "### Modeling Opportunities"])
+    if q["possible_targets"]:
+        for target in q["possible_targets"][:3]:
+            lines.append(f"- **{target['column']}**: {target['reason']} ({target['unique_count']} unique values, {target['missing_percent']:.1f}% missing).")
+    else:
+        lines.append("- No obvious target variable emerged; choose a target based on the business/research question.")
+
+    lines.extend(["", "### Recommended Statistical Tests"])
+    lines.extend(f"- **{r['test']}** on {r['variables']}: {r['why']}" for r in recommend_statistical_tests(df))
+
+    lines.extend(["", "### Recommended Visualizations"])
+    lines.extend(f"- **{r['chart']}** using {r['columns']}: {r['reason']}" for r in recommend_visualizations(df))
+
     lines.extend(
         [
             "",
-            "### Recommended Next Steps",
-            f"- Prioritize cleaning columns with high missingness and review the cleaning audit trail before formal reporting ({missing_total:,} missing values remain).",
-            "- Visualize the highest-variation numeric fields with histograms, boxplots, and scatter plots to understand distribution shape and outliers.",
-            "- Use Chi-square tests for business questions involving two categorical fields, and use Pearson/Spearman correlations for numeric relationship questions.",
-            "- For modeling, start with interpretable predictors, check residual diagnostics for numeric targets, and validate binary classification with accuracy, confusion matrix, and ROC curve.",
+            "### Practical Next Steps",
+            *[f"- {step}" for step in generate_next_steps(df)],
         ]
     )
     return "\n".join(lines)
@@ -759,9 +1136,11 @@ def train_ml_model(df: pd.DataFrame, target: str, predictors: list[str], problem
             "Linear Regression": LinearRegression(),
             "Random Forest Regressor": RandomForestRegressor(n_estimators=200, random_state=random_state),
             "Decision Tree Regressor": DecisionTreeRegressor(random_state=random_state),
+            "KNN Regressor": KNeighborsRegressor(),
+            "SVM Regressor": SVR(),
         }
         estimator = models[model_name]
-        pipeline = Pipeline([("preprocess", make_preprocessor(x, scale_numeric=model_name == "Linear Regression")), ("model", estimator)])
+        pipeline = Pipeline([("preprocess", make_preprocessor(x, scale_numeric=model_name in {"Linear Regression", "KNN Regressor", "SVM Regressor"})), ("model", estimator)])
         x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=test_size, random_state=random_state)
         pipeline.fit(x_train, y_train)
         predictions = pipeline.predict(x_test)
@@ -783,9 +1162,10 @@ def train_ml_model(df: pd.DataFrame, target: str, predictors: list[str], problem
             "Random Forest Classifier": RandomForestClassifier(n_estimators=200, random_state=random_state),
             "Decision Tree Classifier": DecisionTreeClassifier(random_state=random_state),
             "KNN Classifier": KNeighborsClassifier(),
+            "SVM Classifier": SVC(probability=True, random_state=random_state),
         }
         estimator = models[model_name]
-        pipeline = Pipeline([("preprocess", make_preprocessor(x, scale_numeric=model_name in {"Logistic Regression", "KNN Classifier"}),), ("model", estimator)])
+        pipeline = Pipeline([("preprocess", make_preprocessor(x, scale_numeric=model_name in {"Logistic Regression", "KNN Classifier", "SVM Classifier"}),), ("model", estimator)])
         x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=test_size, random_state=random_state, stratify=stratify)
         if y_train.nunique() < 2:
             return {"valid": False, "message": "The train split contains fewer than two classes. Try a smaller test split or a target with more examples per class."}
@@ -818,6 +1198,40 @@ def train_ml_model(df: pd.DataFrame, target: str, predictors: list[str], problem
         coefs = np.ravel(fitted.coef_[0] if np.ndim(fitted.coef_) > 1 else fitted.coef_)
         importance = pd.DataFrame({"feature": feature_names[: len(coefs)], "importance": np.abs(coefs)}).sort_values("importance", ascending=False)
     result["feature_importance"] = importance
+    return result
+
+
+def benchmark_ml_models(df: pd.DataFrame, target: str, predictors: list[str], problem_type: str, test_size: float, random_state: int) -> pd.DataFrame:
+    resolved = problem_type
+    if resolved == "auto-detect":
+        resolved = "regression" if pd.api.types.is_numeric_dtype(df[target]) and df[target].nunique(dropna=True) > 10 else "classification"
+    names = ["Linear Regression", "Random Forest Regressor", "Decision Tree Regressor", "KNN Regressor"] if resolved == "regression" else ["Logistic Regression", "Random Forest Classifier", "Decision Tree Classifier", "KNN Classifier", "SVM Classifier"]
+    rows = []
+    for name in names:
+        try:
+            result = train_ml_model(df, target, predictors, resolved, name, test_size, random_state)
+        except Exception as exc:
+            rows.append({"model": name, "status": f"failed: {exc}", "recommendation_metric": np.nan})
+            continue
+        if not result.get("valid"):
+            rows.append({"model": name, "status": result.get("message", "invalid"), "recommendation_metric": np.nan})
+            continue
+        if resolved == "regression":
+            rows.append({"model": name, "status": "ok", "MAE": result["mae"], "RMSE": result["rmse"], "R2": result["r2"], "recommendation_metric": result["rmse"]})
+        else:
+            rows.append({"model": name, "status": "ok", "accuracy": result["accuracy"], "weighted_F1": result["f1"], "recommendation_metric": -result["f1"]})
+    out = pd.DataFrame(rows)
+    return out.sort_values("recommendation_metric") if not out.empty else out
+
+
+def add_ml_validation_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+    if not result.get("valid"):
+        return result
+    if result["problem_type"] == "regression":
+        warning = "Good fit by R²; still inspect residuals and cross-validate." if result.get("r2", 0) >= 0.7 else "Limited explained variance; improve features, target definition, or nonlinear modeling."
+    else:
+        warning = "Review class-level recall and confusion-matrix errors; high accuracy can hide minority-class failure."
+    result["validation_warning"] = warning
     return result
 
 
@@ -1169,6 +1583,9 @@ def recommend_visualizations(df: pd.DataFrame) -> list[dict[str, str]]:
         recs.append({"chart": "Pair plot / scatter-matrix of top numeric variables", "why": "Provides a compact view of multiple relationships before selecting model predictors."})
     if types.datetime and types.numeric:
         recs.append({"chart": f"Line chart of {types.numeric[0]} over {types.datetime[0]}", "why": "Checks trend, seasonality, and structural breaks over time."})
+    for row in recs:
+        row.setdefault("reason", row.get("why", "Recommended by automated chart rules."))
+        row.setdefault("columns", row.get("chart", "selected columns"))
     return recs[:8]
 
 
@@ -1196,6 +1613,8 @@ def recommend_statistical_tests(df: pd.DataFrame) -> list[dict[str, str]]:
             recs.append({"test": f"Multiple regression for {target}", "why": "Quantifies adjusted relationships, flags important predictors, and reveals multicollinearity/residual issues."})
         else:
             recs.append({"test": f"Logistic/classification analysis for {target}", "why": "Estimates predictive signal while monitoring class imbalance, leakage, and misclassification costs."})
+    for row in recs:
+        row.setdefault("variables", row.get("test", "selected variables"))
     return recs[:8]
 
 
@@ -1571,6 +1990,8 @@ def build_business_report(df: pd.DataFrame, original_df: pd.DataFrame, cleaning_
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     st.session_state.report_generated_at = generated
     findings = summarize_key_findings(df)
+    quality = summarize_data_quality(df, original_df)
+    relationships = compute_relationship_findings(df)
     num_stats = numeric_descriptive_stats(df)
     cat_stats = categorical_summary(df)
     charts = recommended_story_charts(df)
@@ -1583,8 +2004,9 @@ def build_business_report(df: pd.DataFrame, original_df: pd.DataFrame, cleaning_
         "## Dataset Overview",
         f"The analysis uses the uploaded dataset after selected cleaning steps: {df.shape[0]:,} rows and {df.shape[1]:,} columns. The original upload contained {original_df.shape[0]:,} rows and {original_df.shape[1]:,} columns.",
         "",
-        "## Data Quality Summary",
-        f"Missing values represent {missing_pct:.2f}% of cells. Duplicate rows total {int(df.duplicated().sum()):,}. Highest missing-value column: {findings['highest_missing_value_column']}.",
+        "## Data Quality Assessment",
+        f"Dataset health score is {quality['health_score']['score']}/100 ({quality['health_score']['grade']}). Missing values represent {missing_pct:.2f}% of cells. Duplicate rows total {int(df.duplicated().sum()):,}. Highest missing-value column: {findings['highest_missing_value_column']}.",
+        "Key quality flags: " + (", ".join(generate_expert_interpretation(df)[:4]) or "No major automated quality flags were triggered."),
         "",
         "## Executive Summary",
         storytelling_text(df, original_df, cleaning_notes),
@@ -1601,8 +2023,13 @@ def build_business_report(df: pd.DataFrame, original_df: pd.DataFrame, cleaning_
         "## Categorical Summary",
         cat_stats.head(12).to_markdown() if not cat_stats.empty else "No categorical summary is available.",
         "",
-        "## Important Visual Insights",
+        "## Relationship Analysis",
     ]
+    if relationships.get("significant"):
+        lines.extend(f"- {a} vs {b}: Pearson r={r:.3f}, p={p:.4g}, n={n}" for a, b, r, p, n in relationships["significant"][:8])
+    else:
+        lines.append("No statistically significant Pearson correlations were identified by the automatic scan.")
+    lines.extend(["", "## Visualization Insights"])
     lines.extend([f"- {title}: {caption}" for title, _, caption in charts] or ["No recommended visual insights could be generated from the detected data types."])
     lines.extend([
         "",
@@ -1612,9 +2039,12 @@ def build_business_report(df: pd.DataFrame, original_df: pd.DataFrame, cleaning_
         "## ML Model Results",
         ml_summary,
         "",
-        "## Recommended Next Steps",
+        "## Business or Research Implications",
+        generate_business_summary(df),
+        "",
+        "## Recommended Actions",
+        *[f"- {step}" for step in generate_next_steps(df)],
         "- Validate the strongest relationships against domain knowledge before presenting conclusions.",
-        "- Address missingness, duplicates, and imbalanced categories before high-stakes modeling.",
         "- Run targeted statistical tests or ML models tied to a specific business or academic hypothesis.",
         "- Re-run the report after selecting final cleaning settings and model configuration.",
         "",
@@ -1622,6 +2052,12 @@ def build_business_report(df: pd.DataFrame, original_df: pd.DataFrame, cleaning_
         "- Results are based only on the uploaded dataset and selected in-app cleaning choices.",
         "- Correlations and model importance do not prove causation.",
         "- AI chat responses use summaries and metadata rather than the full raw dataset.",
+        "",
+        "## Appendix: Cleaning Notes",
+        *[f"- {note}" for note in cleaning_notes],
+        "",
+        "## Appendix: Target Suggestions",
+        pd.DataFrame(quality["possible_targets"]).to_markdown(index=False) if quality["possible_targets"] else "No target suggestions available.",
     ])
     return "\n".join(lines)
 
@@ -1735,6 +2171,19 @@ def render_visualization(df: pd.DataFrame, chart_type: str, x_col: str | None, y
         return px.scatter_matrix(df, dimensions=numeric_cols[:6], color=color, title="Scatter Matrix")
     if chart_type == "3D scatter plot" and len(numeric_cols) >= 3:
         return px.scatter_3d(df, x=numeric_cols[0], y=numeric_cols[1], z=numeric_cols[2], color=color, title="3D Scatter Plot")
+    if chart_type == "Missing-value heatmap":
+        return missing_value_heatmap(df)
+    if chart_type == "Outlier plot" and (y_col or x_col):
+        col = y_col or x_col
+        if col in numeric_cols:
+            fig = px.box(df, y=col, points="outliers", title=f"IQR outlier review for {col}")
+            lower, upper, _ = iqr_outlier_bounds(df[col])
+            if pd.notna(lower):
+                fig.add_hline(y=lower, line_dash="dash", annotation_text="lower IQR fence")
+                fig.add_hline(y=upper, line_dash="dash", annotation_text="upper IQR fence")
+            return fig
+    if chart_type == "Distribution comparison" and x_col and y_col:
+        return px.box(df, x=x_col, y=y_col, color=color, points="outliers", title=f"Distribution comparison: {y_col} by {x_col}")
     return None
 
 
@@ -1852,38 +2301,62 @@ summary_text = generate_summary_analysis(df, original_df, cleaning_notes, st.ses
 with overview_tab:
     if "Dataset Overview" in selected_sections:
         st.subheader("Dataset Overview")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Rows", f"{df.shape[0]:,}")
-        m2.metric("Columns", f"{df.shape[1]:,}")
-        m3.metric("Missing values", f"{int(df.isna().sum().sum()):,}")
-        m4.metric("Duplicate rows", f"{int(df.duplicated().sum()):,}")
+        quality = summarize_data_quality(df, original_df)
+        health = quality["health_score"]
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Health score", f"{health['score']}/100", health["grade"])
+        m2.metric("Rows", f"{df.shape[0]:,}")
+        m3.metric("Columns", f"{df.shape[1]:,}")
+        m4.metric("Missing cells", f"{int(df.isna().sum().sum()):,}", f"{quality['missing_pct']:.1f}%")
+        m5.metric("Memory", f"{quality['memory_mb']:.2f} MB")
 
-        st.markdown("#### Detected column groups")
-        st.write(
-            {
-                "numeric": numeric_cols,
-                "categorical": column_types.categorical,
-                "datetime": column_types.datetime,
-                "binary": column_types.binary,
-            }
-        )
+        st.markdown("### Column type summary")
+        st.dataframe(pd.DataFrame({
+            "type": ["numeric", "categorical", "binary", "datetime"],
+            "count": [len(column_types.numeric), len(column_types.categorical), len(column_types.binary), len(column_types.datetime)],
+            "columns": [", ".join(column_types.numeric), ", ".join(column_types.categorical), ", ".join(column_types.binary), ", ".join(column_types.datetime)],
+        }), use_container_width=True)
 
-        st.markdown("#### Data types and missing values")
-        schema = pd.DataFrame(
-            {
-                "dtype": df.dtypes.astype(str),
-                "missing_count": df.isna().sum(),
-                "missing_percent": df.isna().mean() * 100,
-                "unique_count": df.nunique(dropna=True),
-            }
-        )
-        st.dataframe(schema, use_container_width=True)
+        st.markdown("### Data-quality diagnostics")
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Duplicate rows", f"{quality['duplicate_rows']:,}", f"{quality['duplicate_percent']:.1f}%")
+        d2.metric("High-cardinality", len(quality["high_cardinality"]))
+        d3.metric("Constant", len(quality["constant_columns"]))
+        d4.metric("Possible IDs", len(quality["possible_id_columns"]))
+        st.dataframe(pd.DataFrame({
+            "dtype": df.dtypes.astype(str),
+            "missing_count": df.isna().sum(),
+            "missing_percent": df.isna().mean() * 100,
+            "unique_count": df.nunique(dropna=True),
+            "unique_percent": df.nunique(dropna=True) / max(len(df), 1) * 100,
+        }), use_container_width=True)
+        if df.isna().sum().sum() > 0:
+            st.plotly_chart(missing_value_heatmap(df), use_container_width=True)
+            if len(df) > 1500:
+                st.caption("Missing-value heatmap uses a reproducible sample of 1,500 rows for performance.")
 
-        st.markdown("#### Cleaning summary")
+        warn_cols = st.columns(3)
+        warn_cols[0].warning("High-cardinality columns: " + (", ".join(quality["high_cardinality"][:8]) or "none detected"))
+        warn_cols[1].warning("Possible ID columns: " + (", ".join(quality["possible_id_columns"][:8]) or "none detected"))
+        warn_cols[2].warning("Leakage-risk names: " + (", ".join(quality["leakage_risk_columns"][:8]) or "none detected"))
+        if quality["constant_columns"] or quality["near_constant_columns"]:
+            st.info("Constant/near-constant columns to review: " + ", ".join((quality["constant_columns"] + quality["near_constant_columns"])[:12]))
+
+        st.markdown("### Possible target variables")
+        if quality["possible_targets"]:
+            st.dataframe(pd.DataFrame(quality["possible_targets"]), use_container_width=True)
+        else:
+            st.info("No high-confidence target candidate was detected; choose a target from the domain question.")
+
+        st.markdown("### Expert data-quality interpretation")
+        for item in generate_expert_interpretation(df):
+            st.write(f"- {item}")
+        st.markdown("### Recommended cleaning actions")
+        for step in generate_next_steps(df):
+            st.write(f"- {step}")
+        st.markdown("### Cleaning audit and sample")
         for note in cleaning_notes:
             st.write(f"- {note}")
-
-        st.markdown("#### Sample rows")
         st.dataframe(df.head(sample_rows), use_container_width=True)
     else:
         st.info("Dataset Overview is hidden by the sidebar section selector.")
@@ -1892,44 +2365,55 @@ with overview_tab:
 with story_tab:
     if "Storytelling Dashboard" in selected_sections:
         st.subheader("Storytelling Dashboard")
-        st.markdown("### Executive summary")
-        st.markdown(storytelling_text(df, original_df, cleaning_notes))
-
-        st.markdown("### KPI cards")
-        missing_pct = safe_pct(df.isna().sum().sum(), df.shape[0] * df.shape[1])
+        quality = summarize_data_quality(df, original_df)
+        st.markdown("### Executive data story")
+        st.markdown(generate_business_summary(df))
         k1, k2, k3, k4, k5, k6 = st.columns(6)
-        k1.metric("Rows", f"{df.shape[0]:,}")
-        k2.metric("Columns", f"{df.shape[1]:,}")
-        k3.metric("Missing %", f"{missing_pct:.1f}%")
-        k4.metric("Duplicates", f"{int(df.duplicated().sum()):,}")
-        k5.metric("Numeric", f"{len(numeric_cols):,}")
-        k6.metric("Categorical", f"{len(categorical_cols):,}")
+        k1.metric("Health", f"{quality['health_score']['score']}/100", quality['health_score']['grade'])
+        k2.metric("Rows", f"{df.shape[0]:,}")
+        k3.metric("Columns", f"{df.shape[1]:,}")
+        k4.metric("Missing %", f"{quality['missing_pct']:.1f}%")
+        k5.metric("Duplicates", f"{quality['duplicate_rows']:,}")
+        k6.metric("Target ideas", len(quality["possible_targets"]))
 
-        st.markdown("### Key findings")
+        st.markdown("### Top 5 insights ranked by importance")
+        insight_rows = []
         findings = summarize_key_findings(df)
-        cards = [
-            ("Strongest positive correlation", findings["strongest_positive_correlation"]),
-            ("Strongest negative correlation", findings["strongest_negative_correlation"]),
-            ("Most variable numeric column", findings["most_variable_numeric_column"]),
-            ("Most imbalanced categorical column", findings["most_imbalanced_categorical_column"]),
-            ("Highest missing-value column", findings["highest_missing_value_column"]),
-        ]
+        insight_rows.append({"rank": 1, "insight": "Strongest positive relationship", "evidence": findings["strongest_positive_correlation"], "why_it_matters": "Positive relationships can identify reinforcing drivers or redundant predictors."})
+        insight_rows.append({"rank": 2, "insight": "Strongest negative relationship", "evidence": findings["strongest_negative_correlation"], "why_it_matters": "Negative relationships can reveal trade-offs, risk factors, or inverse drivers."})
+        insight_rows.append({"rank": 3, "insight": "Largest distribution spread", "evidence": findings["most_variable_numeric_column"], "why_it_matters": "High variance variables often explain segmentation, outliers, or operational inconsistency."})
+        insight_rows.append({"rank": 4, "insight": "Dominant category", "evidence": findings["most_imbalanced_categorical_column"], "why_it_matters": "Imbalance can bias summaries, tests, and model accuracy."})
+        insight_rows.append({"rank": 5, "insight": "Data-quality constraint", "evidence": findings["highest_missing_value_column"], "why_it_matters": "Missingness can reduce statistical power and distort results."})
+        st.dataframe(pd.DataFrame(insight_rows), use_container_width=True, hide_index=True)
+
+        st.markdown("### Key insight and risk cards")
+        cards = [(row["insight"], row["evidence"], row["why_it_matters"]) for row in insight_rows]
         for row_start in range(0, len(cards), 3):
             cols = st.columns(min(3, len(cards) - row_start))
-            for col_obj, (label, value) in zip(cols, cards[row_start: row_start + 3]):
+            for col_obj, (label, evidence, matters) in zip(cols, cards[row_start: row_start + 3]):
                 with col_obj:
-                    st.info(f"**{label}**\n\n{value}")
+                    st.info(f"**{label}**\n\n{evidence}\n\n**Why it matters:** {matters}")
+        for issue in generate_expert_interpretation(df):
+            st.warning(issue)
 
-        st.markdown("### Recommended charts")
+        st.markdown("### Automatic best charts with captions")
         charts = recommended_story_charts(df)
-        if charts:
-            for title, fig, caption in charts:
-                st.plotly_chart(fig, use_container_width=True)
-                st.caption(caption)
-        else:
-            st.info("Upload data with numeric or categorical columns to generate recommended charts.")
+        for title, fig, caption in charts:
+            st.plotly_chart(fig, use_container_width=True)
+            st.markdown(f"**What this means:** {caption}")
+            st.markdown("**Why it matters:** Use this chart to prioritize deeper tests, segmentation, or cleaning before decision-making.")
+        if not charts:
+            st.info("No chart could be generated from the detected data types.")
 
-        st.markdown("### Data Story")
+        st.markdown("### Recommended decision questions")
+        for question in [
+            "Which candidate target variable best represents the decision or outcome we care about?",
+            "Are the strongest relationships stable after removing outliers and reviewing missingness?",
+            "Which groups or categories are underrepresented enough to bias conclusions?",
+            "Which variables are known before the outcome occurs and are therefore safe predictors?",
+        ]:
+            st.write(f"- {question}")
+        st.markdown("### Automatic narrative")
         st.markdown(storytelling_text(df, original_df, cleaning_notes))
     else:
         st.info("Storytelling Dashboard is hidden by the sidebar section selector.")
@@ -1942,37 +2426,60 @@ with summary_tab:
 
 with descriptive_tab:
     if "Descriptive Statistics" in selected_sections:
-        st.subheader("Numeric descriptive statistics")
+        st.subheader("Expert descriptive statistics")
         num_stats = numeric_descriptive_stats(df)
         if num_stats.empty:
             st.info("No numeric columns detected.")
         else:
+            st.markdown("### Numeric variables")
             st.dataframe(num_stats, use_container_width=True)
             st.download_button("Download numeric summary CSV", num_stats.to_csv().encode("utf-8"), "numeric_summary.csv", "text/csv")
-
-        st.subheader("Categorical summaries")
+            st.markdown("### Numeric expert interpretation")
+            skewed = num_stats[num_stats["skewness"].abs() >= 1].sort_values("skewness", key=lambda s: s.abs(), ascending=False)
+            outlier_heavy = num_stats[num_stats["outlier_percent_iqr"] >= 5].sort_values("outlier_percent_iqr", ascending=False)
+            high_cv = num_stats[num_stats["coefficient_of_variation"].replace([np.inf, -np.inf], np.nan) >= 1]
+            for col, row in skewed.head(8).iterrows():
+                st.warning(f"{col} is highly skewed (skew={row['skewness']:.2f}); consider log/Box-Cox transforms, winsorization, or robust/nonparametric tests.")
+            for col, row in outlier_heavy.head(8).iterrows():
+                st.warning(f"{col} has {int(row['outlier_count_iqr']):,} IQR outliers ({row['outlier_percent_iqr']:.1f}%); validate whether these are errors or meaningful extremes.")
+            for col, row in high_cv.head(8).iterrows():
+                st.info(f"{col} has unusual relative spread (CV={row['coefficient_of_variation']:.2f}); compare median/IQR with mean/std.")
+            if skewed.empty and outlier_heavy.empty and high_cv.empty:
+                st.success("No severe skew, outlier, or relative-spread warnings were triggered by the automated rules.")
         cat_stats = categorical_summary(df)
         if cat_stats.empty:
             st.info("No categorical columns detected.")
         else:
+            st.markdown("### Categorical variables")
             st.dataframe(cat_stats, use_container_width=True)
             st.download_button("Download categorical summary CSV", cat_stats.to_csv().encode("utf-8"), "categorical_summary.csv", "text/csv")
-
             selected_cat = st.selectbox("Frequency table column", categorical_cols)
             freq = frequency_table(df, selected_cat)
             st.dataframe(freq, use_container_width=True)
             st.download_button(f"Download {selected_cat} frequency CSV", freq.to_csv().encode("utf-8"), f"{selected_cat}_frequency.csv", "text/csv")
+            st.markdown("### Categorical expert interpretation")
+            for col, row in cat_stats.sort_values("top_value_percent", ascending=False).head(10).iterrows():
+                if row["top_value_percent"] >= 70:
+                    st.warning(f"{col} is strongly imbalanced: {row['top_value']} accounts for {row['top_value_percent']:.1f}% of rows. Stratify summaries and use balanced metrics for classification.")
+                if row["cardinality_warning"] == "High cardinality":
+                    st.warning(f"{col} has high cardinality ({int(row['unique_count'])} unique values). Consider grouping rare levels or excluding ID-like fields from models.")
     else:
         st.info("Descriptive Statistics is hidden by the sidebar section selector.")
 
 with categorical_tab:
     if "Categorical Analysis" in selected_sections:
-        st.subheader("Cross-tabulation and Chi-square test")
+        st.subheader("Categorical relationship intelligence")
+        rec_pairs = categorical_pair_recommendations(df)
+        if not rec_pairs.empty:
+            st.markdown("### Recommended categorical pairs")
+            st.dataframe(rec_pairs, use_container_width=True, hide_index=True)
         if len(categorical_cols) < 2:
             st.info("At least two categorical or binary columns are required.")
         else:
-            col_a = st.selectbox("First categorical column", categorical_cols, index=0)
-            col_b = st.selectbox("Second categorical column", categorical_cols, index=min(1, len(categorical_cols) - 1))
+            default_a = rec_pairs.iloc[0]["first_column"] if not rec_pairs.empty else categorical_cols[0]
+            default_b = rec_pairs.iloc[0]["second_column"] if not rec_pairs.empty else categorical_cols[min(1, len(categorical_cols) - 1)]
+            col_a = st.selectbox("First categorical column", categorical_cols, index=categorical_cols.index(default_a))
+            col_b = st.selectbox("Second categorical column", categorical_cols, index=categorical_cols.index(default_b))
             if col_a == col_b:
                 st.warning("Choose two different categorical columns.")
             else:
@@ -1980,27 +2487,34 @@ with categorical_tab:
                 if not result.get("valid"):
                     st.warning(result["message"])
                 else:
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("χ²", f"{result['chi2']:.4f}")
+                    c2.metric("p-value", f"{result['p_value']:.4g}")
+                    c3.metric("Cramer's V", f"{result['cramers_v']:.3f}")
+                    c4.metric("Strength", result["association_strength"])
+                    st.write(result["interpretation"])
+                    st.markdown(f"**Plain-English interpretation:** The association between **{col_a}** and **{col_b}** is **{result['association_strength']}** by Cramer's V. A significant p-value means the category distribution is unlikely to be independent, not that the relationship is causal.")
+                    for warning in result["warnings"]:
+                        st.warning(warning)
                     st.markdown("#### Observed cross-tabulation")
                     st.dataframe(result["observed"], use_container_width=True)
                     st.markdown("#### Row-normalized cross-tabulation (%)")
                     st.dataframe(result["normalized"], use_container_width=True)
-                    st.markdown("#### Chi-square result")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("χ² statistic", f"{result['chi2']:.4f}")
-                    c2.metric("p-value", f"{result['p_value']:.4g}")
-                    c3.metric("Degrees of freedom", result["dof"])
-                    st.write(result["interpretation"])
+                    st.plotly_chart(px.bar(result["observed"].reset_index().melt(id_vars=col_a, var_name=col_b, value_name="count"), x=col_a, y="count", color=col_b, barmode="stack", title=f"Stacked bar: {col_a} by {col_b}"), use_container_width=True)
+                    st.plotly_chart(px.bar(result["observed"].reset_index().melt(id_vars=col_a, var_name=col_b, value_name="count"), x=col_a, y="count", color=col_b, barmode="group", title=f"Grouped bar: {col_a} by {col_b}"), use_container_width=True)
                     st.markdown("#### Expected frequencies")
                     st.dataframe(result["expected"], use_container_width=True)
-                    record_session_result(f"Chi-square {col_a} × {col_b}: χ²={result['chi2']:.4f}, p={result['p_value']:.4g}, dof={result['dof']}. {result['interpretation']}")
+                    st.markdown("**Recommended follow-up:** Combine rare categories if expected counts are low, then segment key numeric outcomes by these groups or run a supervised model if one variable is a plausible target.")
+                    record_session_result(f"Chi-square {col_a} × {col_b}: χ²={result['chi2']:.4f}, p={result['p_value']:.4g}, Cramer's V={result['cramers_v']:.3f}, dof={result['dof']}. {result['interpretation']}")
     else:
         st.info("Categorical Analysis is hidden by the sidebar section selector.")
 
 with inferential_tab:
     if "Inferential Tests" in selected_sections:
-        st.subheader("Inferential testing")
-        test_name = st.selectbox("Select a test", ["Pearson correlation", "Spearman correlation", "Independent samples t-test", "One-way ANOVA", "Mann-Whitney U", "Kruskal-Wallis"])
-
+        st.subheader("Statistician-guided inferential tests")
+        st.markdown("### Automatic test recommendations")
+        st.dataframe(pd.DataFrame(recommend_statistical_tests(df)), use_container_width=True, hide_index=True)
+        test_name = st.selectbox("Select a test", ["Pearson correlation", "Spearman correlation", "Independent samples t-test", "One-way ANOVA", "Mann-Whitney U", "Kruskal-Wallis", "Chi-square test"])
         if test_name in {"Pearson correlation", "Spearman correlation"}:
             if len(numeric_cols) < 2:
                 st.info("At least two numeric columns are required.")
@@ -2011,26 +2525,57 @@ with inferential_tab:
                     st.warning("Choose two different numeric variables.")
                 else:
                     method = "Pearson" if test_name.startswith("Pearson") else "Spearman"
+                    st.info("Pearson tests linear association; Spearman tests monotonic association and is more robust to skew/outliers.")
+                    for var in [x, y]:
+                        st.write(f"**{var} assumption check:** {statistical_assumption_checks(df, var)['normality']}")
                     result = correlation_test(df, x, y, method)
                     if result.get("valid"):
-                        st.metric(f"{method} statistic", f"{result['statistic']:.4f}")
-                        st.metric("p-value", f"{result['p_value']:.4g}")
-                        st.write(f"Sample size: {result['n']:,}. {result['interpretation']}")
+                        strength = "strong" if abs(result["statistic"]) >= .7 else "moderate" if abs(result["statistic"]) >= .4 else "weak"
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric(f"{method} statistic", f"{result['statistic']:.4f}")
+                        c2.metric("p-value", f"{result['p_value']:.4g}")
+                        c3.metric("n", f"{result['n']:,}")
+                        st.markdown(f"**Plain English:** This is a **{strength}** relationship. {result['interpretation']} Next, inspect a scatter/regression plot to check curvature, clusters, and outliers.")
                         record_session_result(f"{method} correlation {x} vs {y}: statistic={result['statistic']:.4f}, p={result['p_value']:.4g}, n={result['n']}. {result['interpretation']}")
                     else:
                         st.warning(result["message"])
+        elif test_name == "Chi-square test":
+            if len(categorical_cols) < 2:
+                st.info("Chi-square requires two categorical variables.")
+            else:
+                a = st.selectbox("First categorical variable", categorical_cols, key="inf_chi_a")
+                b = st.selectbox("Second categorical variable", categorical_cols, index=min(1, len(categorical_cols)-1), key="inf_chi_b")
+                if a != b:
+                    result = chi_square_analysis(df, a, b)
+                    if result.get("valid"):
+                        st.metric("p-value", f"{result['p_value']:.4g}")
+                        st.metric("Cramer's V", f"{result['cramers_v']:.3f}")
+                        st.write(result["interpretation"])
+                        for warning in result["warnings"]:
+                            st.warning(warning)
+                        st.dataframe(result["observed"], use_container_width=True)
+                else:
+                    st.warning("Choose two different categorical variables.")
         else:
             if not numeric_cols or not categorical_cols:
                 st.info("These tests require one numeric variable and one grouping column.")
             else:
                 numeric = st.selectbox("Numeric outcome", numeric_cols)
                 group = st.selectbox("Grouping variable", categorical_cols)
+                checks = statistical_assumption_checks(df, numeric, group)
+                st.write(f"**Normality:** {checks['normality']}")
+                if "equal_variance" in checks:
+                    st.write(f"**Equal variance:** {checks['equal_variance']}")
+                st.write("**Group sizes:**", checks.get("group_sizes", {}))
+                if any(v < 5 for v in checks.get("group_sizes", {}).values()):
+                    st.warning("One or more groups have fewer than 5 observations; p-values and effect sizes may be unstable.")
                 result = grouped_test(df, numeric, group, test_name)
                 if result.get("valid"):
-                    st.metric("Test statistic", f"{result['statistic']:.4f}")
-                    st.metric("p-value", f"{result['p_value']:.4g}")
-                    st.write(f"Sample size: {result['n']:,}. {result['interpretation']}")
-                    st.write("Group sizes:", result["group_sizes"])
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Test statistic", f"{result['statistic']:.4f}")
+                    c2.metric("p-value", f"{result['p_value']:.4g}")
+                    c3.metric("n", f"{result['n']:,}")
+                    st.markdown(f"**Plain English:** {result['interpretation']} If significant, at least one group differs; follow with pairwise comparisons and effect sizes. If not significant, check power, sample size, and distribution overlap before concluding no effect.")
                     record_session_result(f"{test_name} for {numeric} by {group}: statistic={result['statistic']:.4f}, p={result['p_value']:.4g}, n={result['n']}. {result['interpretation']}")
                 else:
                     st.warning(result["message"])
@@ -2039,17 +2584,31 @@ with inferential_tab:
 
 with regression_tab:
     if "Regression Modeling" in selected_sections:
-        st.subheader("Regression modeling")
-        if not df.columns.tolist():
-            st.info("No columns available.")
+        st.subheader("Expert regression modeling")
+        if df.shape[1] < 2:
+            st.info("Regression needs at least one target and one predictor.")
         else:
+            quality = summarize_data_quality(df)
+            st.markdown("### Model suitability and leakage checks")
+            st.write("Candidate targets:")
+            st.dataframe(pd.DataFrame(quality["possible_targets"]), use_container_width=True, hide_index=True)
             target = st.selectbox("Target variable", df.columns.tolist())
             possible_predictors = [col for col in df.columns if col != target]
-            predictors = st.multiselect("Predictor variables", possible_predictors, default=possible_predictors[: min(3, len(possible_predictors))])
+            predictors = st.multiselect("Predictor variables", possible_predictors, default=possible_predictors[: min(5, len(possible_predictors))])
+            if set(predictors) & set(quality["possible_id_columns"]):
+                st.warning("Possible ID predictors selected; these often leak row identity and fail to generalize.")
+            if set(predictors) & set(quality["leakage_risk_columns"]):
+                st.warning("Potential leakage-risk predictors selected. Confirm they are known before the target outcome occurs.")
             target_is_numeric = target in numeric_cols
             target_is_binary = df[target].dropna().nunique() == 2
             model_type = st.radio("Model type", ["Linear regression", "Logistic regression"], horizontal=True, index=0 if target_is_numeric else 1)
-
+            st.write("Recommended models:", "; ".join(recommend_ml_models(df, target)))
+            vif = vif_table(df, predictors)
+            if not vif.empty:
+                st.markdown("### Multicollinearity check (VIF for numeric predictors)")
+                st.dataframe(vif, use_container_width=True)
+                if (vif["VIF"] >= 10).any():
+                    st.warning("High VIF values indicate multicollinearity; coefficients may be unstable even if predictions are acceptable.")
             if st.button("Run regression model", type="primary"):
                 if not predictors:
                     st.warning("Select at least one predictor.")
@@ -2059,16 +2618,27 @@ with regression_tab:
                     else:
                         result = linear_regression_model(df, target, predictors)
                         if result.get("valid"):
-                            st.metric("R-squared", f"{result['r_squared']:.4f}")
-                            st.metric("Adjusted R-squared", f"{result['adjusted_r_squared']:.4f}")
-                            st.write(f"Sample size: {result['n']:,}; intercept: {result['intercept']:.4f}")
+                            rmse = float(np.sqrt(np.mean(np.square(result["predictions"]["residual"]))))
+                            mae = float(np.mean(np.abs(result["predictions"]["residual"])))
+                            m1, m2, m3, m4 = st.columns(4)
+                            m1.metric("R²", f"{result['r_squared']:.4f}")
+                            m2.metric("Adjusted R²", f"{result['adjusted_r_squared']:.4f}")
+                            m3.metric("MAE", f"{mae:.4g}")
+                            m4.metric("RMSE", f"{rmse:.4g}")
                             st.dataframe(result["coefficients"], use_container_width=True)
                             st.dataframe(result["residual_summary"], use_container_width=True)
+                            pred_fig = px.scatter(result["predictions"], x="actual", y="predicted", title="Predicted vs Actual")
+                            min_val = float(np.nanmin([result["predictions"]["actual"].min(), result["predictions"]["predicted"].min()]))
+                            max_val = float(np.nanmax([result["predictions"]["actual"].max(), result["predictions"]["predicted"].max()]))
+                            pred_fig.add_shape(type="line", x0=min_val, x1=max_val, y0=min_val, y1=max_val, line=dict(dash="dash"))
+                            st.plotly_chart(pred_fig, use_container_width=True)
                             fig = px.scatter(result["predictions"], x="predicted", y="residual", trendline="ols", title="Residual Plot")
                             fig.add_hline(y=0, line_dash="dash")
                             st.plotly_chart(fig, use_container_width=True)
+                            st.markdown("**Interpretation:** Coefficients estimate the expected target change per one-unit predictor change, holding other included predictors constant. Use p-values as evidence strength, but rely on residual plots and validation before decisions.")
+                            st.markdown("**Limitations and next steps:** Check nonlinearity, heteroskedasticity, multicollinearity, outliers, and leakage; compare against regularized or tree-based models.")
                             important = result["coefficients"].drop(index="const", errors="ignore").sort_values("coefficient", key=np.abs, ascending=False).head(3)
-                            st.session_state.regression_text = f"- Linear regression predicting **{target}** used {result['n']:,} complete rows and achieved R²={result['r_squared']:.3f} (adjusted R²={result['adjusted_r_squared']:.3f}). The largest absolute predictors were {', '.join(important.index.astype(str).tolist()) or 'not available'}."
+                            st.session_state.regression_text = f"- Linear regression predicting **{target}** used {result['n']:,} complete rows and achieved R²={result['r_squared']:.3f} (adjusted R²={result['adjusted_r_squared']:.3f}, MAE={mae:.3g}, RMSE={rmse:.3g}). Largest absolute predictors: {', '.join(important.index.astype(str).tolist()) or 'not available'}."
                         else:
                             st.warning(result["message"])
                 else:
@@ -2085,17 +2655,18 @@ with regression_tab:
                             roc_fig = px.line(result["roc"], x="fpr", y="tpr", title="ROC Curve")
                             roc_fig.add_shape(type="line", x0=0, x1=1, y0=0, y1=1, line=dict(dash="dash"))
                             st.plotly_chart(roc_fig, use_container_width=True)
+                            st.markdown("**Interpretation:** Larger absolute logistic coefficients have stronger association with class odds after preprocessing. Validate with confusion matrix, ROC curve, and class-specific recall.")
+                            st.markdown("**Limitations and next steps:** Check class imbalance, rare categories, leakage, calibration, and compare with tree-based classifiers.")
                             top_features = result["coefficients"].head(3)["feature"].tolist()
-                            st.session_state.regression_text = f"- Logistic regression predicting **{target}** achieved accuracy={result['accuracy']:.3f} on {result['n_test']:,} test rows. The largest absolute coefficients were {', '.join(top_features)}."
+                            st.session_state.regression_text = f"- Logistic regression predicting **{target}** achieved accuracy={result['accuracy']:.3f} on {result['n_test']:,} test rows. Largest absolute coefficients: {', '.join(top_features)}."
                         else:
                             st.warning(result["message"])
     else:
         st.info("Regression Modeling is hidden by the sidebar section selector.")
 
-
 with ml_tab:
     if "Machine Learning" in selected_sections:
-        st.subheader("Machine Learning")
+        st.subheader("Practical Machine Learning Workbench")
         if df.shape[1] < 2:
             st.info("Machine learning requires at least one target and one predictor column.")
         else:
@@ -2103,33 +2674,49 @@ with ml_tab:
             with c1:
                 ml_target = st.selectbox("Target column", df.columns.tolist(), key="ml_target")
                 ml_predictor_options = [col for col in df.columns if col != ml_target]
-                ml_predictors = st.multiselect("Predictor columns", ml_predictor_options, default=ml_predictor_options[: min(5, len(ml_predictor_options))], key="ml_predictors")
+                ml_predictors = st.multiselect("Feature columns", ml_predictor_options, default=ml_predictor_options[: min(8, len(ml_predictor_options))], key="ml_predictors")
                 problem_type = st.radio("Problem type", ["auto-detect", "regression", "classification"], horizontal=False)
-                resolved_type = problem_type
-                if resolved_type == "auto-detect":
-                    resolved_type = "regression" if ml_target in numeric_cols and df[ml_target].nunique(dropna=True) > 10 else "classification"
-                model_options = ["Linear Regression", "Random Forest Regressor", "Decision Tree Regressor"] if resolved_type == "regression" else ["Logistic Regression", "Random Forest Classifier", "Decision Tree Classifier", "KNN Classifier"]
+                resolved_type = "regression" if problem_type == "auto-detect" and ml_target in numeric_cols and df[ml_target].nunique(dropna=True) > 10 else ("classification" if problem_type == "auto-detect" else problem_type)
+                model_options = ["Linear Regression", "Random Forest Regressor", "Decision Tree Regressor", "KNN Regressor", "SVM Regressor"] if resolved_type == "regression" else ["Logistic Regression", "Random Forest Classifier", "Decision Tree Classifier", "KNN Classifier", "SVM Classifier"]
                 model_name = st.selectbox("Model", model_options)
                 test_size = st.slider("Test split", 0.1, 0.5, 0.25, 0.05)
                 random_state = st.number_input("Random seed", min_value=0, max_value=9999, value=42, step=1)
-                run_ml = st.button("Train model", type="primary")
+                run_ml = st.button("Train selected model", type="primary")
+                compare_ml = st.button("Compare baseline models")
             with c2:
-                st.write("**Modeling notes**")
-                st.write("Categorical predictors are one-hot encoded, numeric predictors are imputed, and missing target rows are removed. Scaling is applied for Logistic Regression, KNN, and Linear Regression.")
-                st.write(f"Detected problem type: **{resolved_type}**")
+                st.write("**Automatic problem detection:**", resolved_type)
+                st.write("**Preprocessing:** numeric median imputation, categorical most-frequent imputation, one-hot encoding, and scaling for distance/margin models.")
+                for rec in recommend_ml_models(df, ml_target):
+                    st.write(f"- {rec}")
+                q = summarize_data_quality(df)
+                if ml_target in q["possible_id_columns"]:
+                    st.warning("Selected target looks ID-like; model metrics may be meaningless.")
+                if set(ml_predictors) & set(q["leakage_risk_columns"]):
+                    st.warning("Leakage-risk feature names selected. Confirm features exist before the prediction point.")
+
+            if compare_ml and ml_predictors:
+                comparison = benchmark_ml_models(df, ml_target, ml_predictors, problem_type, float(test_size), int(random_state))
+                st.session_state.ml_model_comparison = comparison
+            if "ml_model_comparison" in st.session_state:
+                st.markdown("### Model comparison table")
+                st.dataframe(st.session_state.ml_model_comparison, use_container_width=True, hide_index=True)
+                valid = st.session_state.ml_model_comparison[st.session_state.ml_model_comparison["status"] == "ok"]
+                if not valid.empty:
+                    st.success(f"Recommended best baseline by holdout metric: {valid.iloc[0]['model']}.")
 
             if run_ml:
                 result = train_ml_model(df, ml_target, ml_predictors, problem_type, model_name, float(test_size), int(random_state))
                 if not result.get("valid"):
                     st.warning(result["message"])
                 else:
+                    result = add_ml_validation_diagnostics(result)
                     st.session_state.ml_results = {"raw": result, "summary": model_interpretation(result)}
                     st.success("Model trained successfully.")
-
             result = st.session_state.get("ml_results", {}).get("raw")
             if result and result.get("valid"):
                 st.markdown("### Model results")
                 st.info(model_interpretation(result))
+                st.warning(result.get("validation_warning", "Use cross-validation or repeated splits before production use."))
                 if result["problem_type"] == "regression":
                     m1, m2, m3, m4, m5 = st.columns(5)
                     m1.metric("Model", result["model_name"])
@@ -2162,33 +2749,21 @@ with ml_tab:
                     st.markdown("### Feature importance")
                     st.dataframe(result["feature_importance"].head(30), use_container_width=True)
                     st.plotly_chart(px.bar(result["feature_importance"].head(15), x="importance", y="feature", orientation="h", title="Top feature importance"), use_container_width=True)
+                    st.markdown("**Expert recommendation:** Treat importance as model-specific association, not causation; confirm stability with permutation importance/cross-validation and domain review.")
     else:
         st.info("Machine Learning is hidden by the sidebar section selector.")
 
 with visualization_tab:
     if "Visualizations" in selected_sections:
-        st.subheader("Interactive visualization builder")
-        chart_type = st.selectbox(
-            "Chart type",
-            [
-                "Histogram",
-                "KDE/density plot",
-                "Boxplot",
-                "Violin plot",
-                "Scatter plot",
-                "Regression scatter plot",
-                "Correlation heatmap",
-                "Bar chart",
-                "Count plot",
-                "Grouped bar chart",
-                "Line plot",
-                "Pie chart",
-                "Stacked bar chart",
-                "Area chart",
-                "Pair plot style scatter matrix",
-                "3D scatter plot",
-            ],
-        )
+        st.subheader("Expert Visualization Studio")
+        st.markdown("### Chart recommendation engine")
+        st.dataframe(pd.DataFrame(recommend_visualizations(df)), use_container_width=True, hide_index=True)
+        st.markdown("### Automatic best charts")
+        for title, auto_fig, caption in recommended_story_charts(df):
+            st.plotly_chart(auto_fig, use_container_width=True)
+            st.markdown(f"**Caption:** {caption}")
+            st.markdown(chart_explanation(title))
+        chart_type = st.selectbox("Chart type", ["Histogram", "KDE/density plot", "Boxplot", "Violin plot", "Scatter plot", "Regression scatter plot", "Correlation heatmap", "Bar chart", "Count plot", "Grouped bar chart", "Line plot", "Pie chart", "Stacked bar chart", "Area chart", "Pair plot style scatter matrix", "3D scatter plot", "Missing-value heatmap", "Outlier plot", "Distribution comparison"])
         c1, c2, c3, c4 = st.columns(4)
         with c1:
             x_col = st.selectbox("X-axis", all_cols_with_none, index=1 if len(all_cols_with_none) > 1 else 0)
@@ -2199,26 +2774,15 @@ with visualization_tab:
             color_col = st.selectbox("Color/group", all_cols_with_none)
         with c4:
             agg = st.selectbox("Aggregation", ["Mean", "Median", "Sum", "Count"], index=0)
-
-        fig = render_visualization(
-            df,
-            chart_type,
-            None if x_col == "None" else x_col,
-            None if y_col == "None" else y_col,
-            color_col,
-            agg,
-        )
+        fig = render_visualization(df, chart_type, None if x_col == "None" else x_col, None if y_col == "None" else y_col, color_col, agg)
         if fig is None:
             st.warning("This chart needs different variable selections or more numeric columns.")
         else:
             st.plotly_chart(fig, use_container_width=True)
-            chart_record = {
-                "chart_type": chart_type,
-                "x": None if x_col == "None" else x_col,
-                "y": None if y_col == "None" else y_col,
-                "color": None if color_col == "None" else color_col,
-                "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-            }
+            st.markdown(chart_explanation(chart_type, None if x_col == "None" else x_col, None if y_col == "None" else y_col))
+            html_chart = fig.to_html(include_plotlyjs="cdn")
+            st.download_button("Export chart as HTML", html_chart.encode("utf-8"), f"{chart_type.lower().replace(' ', '_')}.html", "text/html")
+            chart_record = {"chart_type": chart_type, "x": None if x_col == "None" else x_col, "y": None if y_col == "None" else y_col, "color": None if color_col == "None" else color_col, "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
             if chart_record not in st.session_state.chart_history:
                 st.session_state.chart_history.append(chart_record)
                 st.session_state.chart_history = st.session_state.chart_history[-12:]
