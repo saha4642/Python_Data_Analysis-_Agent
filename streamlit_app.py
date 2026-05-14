@@ -644,6 +644,75 @@ def chart_explanation(chart_type: str, x_col: str | None = None, y_col: str | No
     )
 
 
+def short_chart_description(chart_type: str) -> str:
+    descriptions = {
+        "Histogram": "Shows the distribution and spread of a numeric variable.",
+        "KDE/density plot": "Shows the smoothed distribution shape of a numeric variable.",
+        "Boxplot": "Highlights median, spread, and potential outliers.",
+        "Violin plot": "Combines distribution shape with median and spread cues.",
+        "Scatter plot": "Useful for exploring relationships between two numeric variables.",
+        "Regression scatter plot": "Shows the relationship between two numeric variables with a fitted trend line.",
+        "Correlation heatmap": "Shows correlation strength between numeric variables.",
+        "Bar chart": "Compares an aggregated numeric measure across categories.",
+        "Count plot": "Shows how many rows fall into each category.",
+        "Grouped bar chart": "Compares aggregated values across categories and groups.",
+        "Line plot": "Shows how a numeric value changes across an ordered axis.",
+        "Pie chart": "Shows category share of the whole for a single field.",
+        "Stacked bar chart": "Shows category composition within each group.",
+        "Area chart": "Shows cumulative magnitude across an ordered axis.",
+        "Pair plot style scatter matrix": "Compares several numeric relationships at once.",
+        "3D scatter plot": "Explores three numeric dimensions in one interactive view.",
+        "Missing-value heatmap": "Reveals where missing values appear across rows and columns.",
+        "Outlier plot": "Highlights potential extreme values using IQR fences.",
+        "Distribution comparison": "Compares a numeric distribution across categories.",
+    }
+    return descriptions.get(chart_type, "Summarizes the selected fields in an interactive chart.")
+
+
+def compact_numeric_summary(num_stats: pd.DataFrame) -> pd.DataFrame:
+    if num_stats.empty:
+        return pd.DataFrame()
+    cols = ["count", "mean", "median", "std", "min", "max", "missing_percent"]
+    out = num_stats[[c for c in cols if c in num_stats.columns]].reset_index()
+    out = out.rename(columns={"missing_percent": "missing %"})
+    return out.round(3)
+
+
+def compact_categorical_summary(cat_stats: pd.DataFrame) -> pd.DataFrame:
+    if cat_stats.empty:
+        return pd.DataFrame()
+    cols = ["unique_count", "top_value", "top_value_percent", "missing_percent"]
+    out = cat_stats[[c for c in cols if c in cat_stats.columns]].reset_index()
+    out = out.rename(columns={"top_value_percent": "top value %", "missing_percent": "missing %"})
+    return out.round(3)
+
+
+def descriptive_takeaways(num_stats: pd.DataFrame, cat_stats: pd.DataFrame) -> list[str]:
+    takeaways: list[str] = []
+    if not num_stats.empty and "skewness" in num_stats:
+        skewed = num_stats[num_stats["skewness"].abs() >= 1].sort_values("skewness", key=lambda s: s.abs(), ascending=False)
+        if not skewed.empty:
+            takeaways.append("Highly skewed variables to review: " + ", ".join(skewed.head(3).index.astype(str)) + ".")
+    if not num_stats.empty and "outlier_percent_iqr" in num_stats:
+        outliers = num_stats[num_stats["outlier_percent_iqr"] >= 5].sort_values("outlier_percent_iqr", ascending=False)
+        if not outliers.empty:
+            takeaways.append("Outlier-heavy variables: " + ", ".join(f"{idx} ({row['outlier_percent_iqr']:.1f}%)" for idx, row in outliers.head(3).iterrows()) + ".")
+    missing = pd.concat([
+        num_stats.get("missing_percent", pd.Series(dtype=float)),
+        cat_stats.get("missing_percent", pd.Series(dtype=float)),
+    ]).sort_values(ascending=False)
+    if not missing.empty and missing.iloc[0] > 0:
+        takeaways.append(f"Missing-value concern: {missing.index[0]} has the highest missing share ({missing.iloc[0]:.1f}%).")
+    if not cat_stats.empty and "top_value_percent" in cat_stats:
+        imbalanced = cat_stats[cat_stats["top_value_percent"] >= 70].sort_values("top_value_percent", ascending=False)
+        if not imbalanced.empty:
+            takeaways.append("Imbalanced categorical variables: " + ", ".join(f"{idx} ({row['top_value_percent']:.1f}% top value)" for idx, row in imbalanced.head(3).iterrows()) + ".")
+    if not takeaways:
+        takeaways.append("No severe automated warnings were detected; validate distributions against business rules before modeling.")
+    takeaways.append("Recommended next step: inspect one priority numeric chart and one priority categorical chart, then choose targeted tests or models.")
+    return takeaways[:6]
+
+
 # -----------------------------------------------------------------------------
 # Statistical tests and modeling
 # -----------------------------------------------------------------------------
@@ -2003,66 +2072,69 @@ def build_business_report(df: pd.DataFrame, original_df: pd.DataFrame, cleaning_
     charts = recommended_story_charts(df)
     ml_summary = st.session_state.get("ml_results", {}).get("summary", "No machine-learning model has been run during this session.")
     missing_pct = safe_pct(df.isna().sum().sum(), df.shape[0] * df.shape[1])
+    takeaways = [
+        f"The working dataset contains {df.shape[0]:,} rows and {df.shape[1]:,} columns after cleaning.",
+        f"Overall data-health score is {quality['health_score']['score']}/100 ({quality['health_score']['grade']}).",
+        f"The strongest positive relationship is {findings['strongest_positive_correlation']}.",
+        f"The strongest negative relationship is {findings['strongest_negative_correlation']}.",
+        f"The largest missing-value concern is {findings['highest_missing_value_column']}.",
+    ]
+    risks = generate_expert_interpretation(df)[:4] or ["No major automated data-quality risk was detected, but business-rule validation is still recommended."]
+    next_questions = likely_business_questions(df)[:4]
+
     lines = [
         "# InsightForge Business Analysis Report",
         f"Generated: {generated}",
         "",
-        "## Dataset Overview",
-        f"The analysis uses the uploaded dataset after selected cleaning steps: {df.shape[0]:,} rows and {df.shape[1]:,} columns. The original upload contained {original_df.shape[0]:,} rows and {original_df.shape[1]:,} columns.",
+        "## Executive Snapshot",
+        f"This report summarizes the uploaded dataset in plain English for decision-makers. The original file contained {original_df.shape[0]:,} rows and {original_df.shape[1]:,} columns; the current analysis uses {df.shape[0]:,} rows and {df.shape[1]:,} columns after selected cleaning steps.",
         "",
-        "## Data Quality Assessment",
-        f"Dataset health score is {quality['health_score']['score']}/100 ({quality['health_score']['grade']}). Missing values represent {missing_pct:.2f}% of cells. Duplicate rows total {int(df.duplicated().sum()):,}. Highest missing-value column: {findings['highest_missing_value_column']}.",
-        "Key quality flags: " + (", ".join(generate_expert_interpretation(df)[:4]) or "No major automated quality flags were triggered."),
+        "## Key Takeaways",
+        *[f"- {item}" for item in takeaways],
         "",
-        "## Executive Summary",
-        storytelling_text(df, original_df, cleaning_notes),
+        "## Recommended Actions",
+        *[f"- {step}" for step in generate_next_steps(df)[:5]],
+        "- Validate the most important relationships with domain knowledge before using them for decisions.",
+        "- Choose one clear outcome or business question before running deeper models.",
         "",
-        "## Key Findings",
-        f"- Strongest positive correlation: {findings['strongest_positive_correlation']}",
-        f"- Strongest negative correlation: {findings['strongest_negative_correlation']}",
-        f"- Most variable numeric column: {findings['most_variable_numeric_column']}",
-        f"- Most imbalanced categorical column: {findings['most_imbalanced_categorical_column']}",
+        "## Risks and Concerns",
+        *[f"- {risk}" for risk in risks],
+        f"- Missing values represent {missing_pct:.2f}% of all cells and duplicate rows total {int(df.duplicated().sum()):,}.",
+        "- Correlation, statistical significance, and model importance should not be interpreted as causation without study design support.",
         "",
-        "## Descriptive Statistics Summary",
+        "## What to Explore Next",
+        *[f"- {question}" for question in next_questions],
+        "",
+        "## Plain-English Findings",
+        f"- Most variable numeric field: {findings['most_variable_numeric_column']}",
+        f"- Most imbalanced category: {findings['most_imbalanced_categorical_column']}",
+        f"- Suggested visual checks: " + ("; ".join(f"{title} — {caption}" for title, _, caption in charts[:3]) if charts else "No automatic visual checks were available for the detected data types."),
+        "",
+        "## Technical Appendix: Descriptive Statistics",
         num_stats.head(12).to_markdown() if not num_stats.empty else "No numeric descriptive statistics are available.",
         "",
-        "## Categorical Summary",
+        "## Technical Appendix: Categorical Summary",
         cat_stats.head(12).to_markdown() if not cat_stats.empty else "No categorical summary is available.",
         "",
-        "## Relationship Analysis",
+        "## Technical Appendix: Relationship Analysis",
     ]
     if relationships.get("significant"):
         lines.extend(f"- {a} vs {b}: Pearson r={r:.3f}, p={p:.4g}, n={n}" for a, b, r, p, n in relationships["significant"][:8])
     else:
         lines.append("No statistically significant Pearson correlations were identified by the automatic scan.")
-    lines.extend(["", "## Visualization Insights"])
-    lines.extend([f"- {title}: {caption}" for title, _, caption in charts] or ["No recommended visual insights could be generated from the detected data types."])
     lines.extend([
         "",
-        "## Statistical Test Results",
+        "## Technical Appendix: Statistical Tests and ML",
+        "### Statistical test results",
         *(test_results[-10:] if test_results else ["No statistical tests have been recorded during this session."]),
         "",
-        "## ML Model Results",
+        "### ML model results",
         ml_summary,
         "",
-        "## Business or Research Implications",
-        generate_business_summary(df),
-        "",
-        "## Recommended Actions",
-        *[f"- {step}" for step in generate_next_steps(df)],
-        "- Validate the strongest relationships against domain knowledge before presenting conclusions.",
-        "- Run targeted statistical tests or ML models tied to a specific business or academic hypothesis.",
-        "- Re-run the report after selecting final cleaning settings and model configuration.",
-        "",
-        "## Limitations",
-        "- Results are based only on the uploaded dataset and selected in-app cleaning choices.",
-        "- Correlations and model importance do not prove causation.",
-        "- AI chat responses use summaries and metadata rather than the full raw dataset.",
-        "",
-        "## Appendix: Cleaning Notes",
+        "## Technical Appendix: Cleaning Notes",
         *[f"- {note}" for note in cleaning_notes],
         "",
-        "## Appendix: Target Suggestions",
+        "## Technical Appendix: Target Suggestions",
         pd.DataFrame(quality["possible_targets"]).to_markdown(index=False) if quality["possible_targets"] else "No target suggestions available.",
     ])
     return "\n".join(lines)
@@ -2371,56 +2443,51 @@ with overview_tab:
 with story_tab:
     if "Storytelling Dashboard" in selected_sections:
         st.subheader("Storytelling Dashboard")
-        quality = summarize_data_quality(df, original_df)
-        st.markdown("### Executive data story")
-        st.markdown(generate_business_summary(df))
-        k1, k2, k3, k4, k5, k6 = st.columns(6)
-        k1.metric("Health", f"{quality['health_score']['score']}/100", quality['health_score']['grade'])
-        k2.metric("Rows", f"{df.shape[0]:,}")
-        k3.metric("Columns", f"{df.shape[1]:,}")
-        k4.metric("Missing %", f"{quality['missing_pct']:.1f}%")
-        k5.metric("Duplicates", f"{quality['duplicate_rows']:,}")
-        k6.metric("Target ideas", len(quality["possible_targets"]))
+        st.caption("A concise executive snapshot of the dataset, focused on the few signals most worth acting on first.")
 
-        st.markdown("### Top 5 insights ranked by importance")
-        insight_rows = []
         findings = summarize_key_findings(df)
-        insight_rows.append({"rank": 1, "insight": "Strongest positive relationship", "evidence": findings["strongest_positive_correlation"], "why_it_matters": "Positive relationships can identify reinforcing drivers or redundant predictors."})
-        insight_rows.append({"rank": 2, "insight": "Strongest negative relationship", "evidence": findings["strongest_negative_correlation"], "why_it_matters": "Negative relationships can reveal trade-offs, risk factors, or inverse drivers."})
-        insight_rows.append({"rank": 3, "insight": "Largest distribution spread", "evidence": findings["most_variable_numeric_column"], "why_it_matters": "High variance variables often explain segmentation, outliers, or operational inconsistency."})
-        insight_rows.append({"rank": 4, "insight": "Dominant category", "evidence": findings["most_imbalanced_categorical_column"], "why_it_matters": "Imbalance can bias summaries, tests, and model accuracy."})
-        insight_rows.append({"rank": 5, "insight": "Data-quality constraint", "evidence": findings["highest_missing_value_column"], "why_it_matters": "Missingness can reduce statistical power and distort results."})
-        st.dataframe(pd.DataFrame(insight_rows), use_container_width=True, hide_index=True)
+        quality = summarize_data_quality(df, original_df)
+        missing_pct = safe_pct(df.isna().sum().sum(), df.shape[0] * df.shape[1])
+        kpi_cols = st.columns(5)
+        kpi_cols[0].metric("Rows", f"{df.shape[0]:,}")
+        kpi_cols[1].metric("Columns", f"{df.shape[1]:,}")
+        kpi_cols[2].metric("Quality", f"{quality['health_score']['score']}/100", quality['health_score']['grade'])
+        kpi_cols[3].metric("Missing cells", f"{missing_pct:.1f}%")
+        kpi_cols[4].metric("Duplicates", f"{int(df.duplicated().sum()):,}")
 
-        st.markdown("### Key insight and risk cards")
-        cards = [(row["insight"], row["evidence"], row["why_it_matters"]) for row in insight_rows]
-        for row_start in range(0, len(cards), 3):
-            cols = st.columns(min(3, len(cards) - row_start))
-            for col_obj, (label, evidence, matters) in zip(cols, cards[row_start: row_start + 3]):
-                with col_obj:
-                    st.info(f"**{label}**\n\n{evidence}\n\n**Why it matters:** {matters}")
-        for issue in generate_expert_interpretation(df):
-            st.warning(issue)
+        left, right = st.columns([1.05, 1.35], gap="large")
+        with left:
+            st.markdown("### Key findings")
+            top_findings = [
+                f"**Strongest positive relationship:** {findings['strongest_positive_correlation']}",
+                f"**Strongest negative relationship:** {findings['strongest_negative_correlation']}",
+                f"**Most variable measure:** {findings['most_variable_numeric_column']}",
+                f"**Largest missingness:** {findings['highest_missing_value_column']}",
+                f"**Most dominant category:** {findings['most_imbalanced_categorical_column']}",
+            ]
+            for item in top_findings:
+                st.markdown(f"- {item}")
 
-        st.markdown("### Automatic best charts with captions")
-        charts = recommended_story_charts(df)
-        for index, (title, fig, caption) in enumerate(charts):
-            st.plotly_chart(fig, use_container_width=True, key=f"story_auto_chart_{index}_{chart_key_part(title)}")
-            st.markdown(f"**What this means:** {caption}")
-            st.markdown("**Why it matters:** Use this chart to prioritize deeper tests, segmentation, or cleaning before decision-making.")
-        if not charts:
-            st.info("No chart could be generated from the detected data types.")
+            st.markdown("### Top insights")
+            for insight in generate_expert_interpretation(df)[:4]:
+                st.info(insight)
 
-        st.markdown("### Recommended decision questions")
-        for question in [
-            "Which candidate target variable best represents the decision or outcome we care about?",
-            "Are the strongest relationships stable after removing outliers and reviewing missingness?",
-            "Which groups or categories are underrepresented enough to bias conclusions?",
-            "Which variables are known before the outcome occurs and are therefore safe predictors?",
-        ]:
-            st.write(f"- {question}")
-        st.markdown("### Automatic narrative")
-        st.markdown(storytelling_text(df, original_df, cleaning_notes))
+        with right:
+            st.markdown("### Automatic charts")
+            charts = recommended_story_charts(df)[:2]
+            if charts:
+                for index, (title, fig, caption) in enumerate(charts):
+                    fig.update_layout(margin=dict(l=20, r=20, t=55, b=25), height=380)
+                    st.plotly_chart(fig, use_container_width=True, key=f"story_auto_chart_{index}_{chart_key_part(title)}")
+                    st.caption(caption)
+            else:
+                st.info("No chart could be generated from the detected data types.")
+
+        with st.expander("Short expert explanation", expanded=False):
+            st.markdown(storytelling_text(df, original_df, cleaning_notes))
+        with st.expander("Recommended decision questions", expanded=False):
+            for question in likely_business_questions(df)[:4]:
+                st.write(f"- {question}")
     else:
         st.info("Storytelling Dashboard is hidden by the sidebar section selector.")
 
@@ -2432,43 +2499,68 @@ with summary_tab:
 
 with descriptive_tab:
     if "Descriptive Statistics" in selected_sections:
-        st.subheader("Expert descriptive statistics")
+        st.subheader("Descriptive Statistics")
+        st.caption("This section summarizes the typical values, spread, missing values, and category patterns in the dataset.")
         num_stats = numeric_descriptive_stats(df)
-        if num_stats.empty:
-            st.info("No numeric columns detected.")
-        else:
-            st.markdown("### Numeric variables")
-            st.dataframe(num_stats, use_container_width=True)
-            st.download_button("Download numeric summary CSV", num_stats.to_csv().encode("utf-8"), "numeric_summary.csv", "text/csv")
-            st.markdown("### Numeric expert interpretation")
-            skewed = num_stats[num_stats["skewness"].abs() >= 1].sort_values("skewness", key=lambda s: s.abs(), ascending=False)
-            outlier_heavy = num_stats[num_stats["outlier_percent_iqr"] >= 5].sort_values("outlier_percent_iqr", ascending=False)
-            high_cv = num_stats[num_stats["coefficient_of_variation"].replace([np.inf, -np.inf], np.nan) >= 1]
-            for col, row in skewed.head(8).iterrows():
-                st.warning(f"{col} is highly skewed (skew={row['skewness']:.2f}); consider log/Box-Cox transforms, winsorization, or robust/nonparametric tests.")
-            for col, row in outlier_heavy.head(8).iterrows():
-                st.warning(f"{col} has {int(row['outlier_count_iqr']):,} IQR outliers ({row['outlier_percent_iqr']:.1f}%); validate whether these are errors or meaningful extremes.")
-            for col, row in high_cv.head(8).iterrows():
-                st.info(f"{col} has unusual relative spread (CV={row['coefficient_of_variation']:.2f}); compare median/IQR with mean/std.")
-            if skewed.empty and outlier_heavy.empty and high_cv.empty:
-                st.success("No severe skew, outlier, or relative-spread warnings were triggered by the automated rules.")
         cat_stats = categorical_summary(df)
-        if cat_stats.empty:
-            st.info("No categorical columns detected.")
-        else:
-            st.markdown("### Categorical variables")
-            st.dataframe(cat_stats, use_container_width=True)
-            st.download_button("Download categorical summary CSV", cat_stats.to_csv().encode("utf-8"), "categorical_summary.csv", "text/csv")
-            selected_cat = st.selectbox("Frequency table column", categorical_cols)
-            freq = frequency_table(df, selected_cat)
-            st.dataframe(freq, use_container_width=True)
-            st.download_button(f"Download {selected_cat} frequency CSV", freq.to_csv().encode("utf-8"), f"{selected_cat}_frequency.csv", "text/csv")
-            st.markdown("### Categorical expert interpretation")
-            for col, row in cat_stats.sort_values("top_value_percent", ascending=False).head(10).iterrows():
-                if row["top_value_percent"] >= 70:
-                    st.warning(f"{col} is strongly imbalanced: {row['top_value']} accounts for {row['top_value_percent']:.1f}% of rows. Stratify summaries and use balanced metrics for classification.")
-                if row["cardinality_warning"] == "High cardinality":
-                    st.warning(f"{col} has high cardinality ({int(row['unique_count'])} unique values). Consider grouping rare levels or excluding ID-like fields from models.")
+        findings = summarize_key_findings(df)
+
+        kpi_cols = st.columns(5)
+        kpi_cols[0].metric("Numeric columns", findings["numeric_count"])
+        kpi_cols[1].metric("Categorical columns", findings["categorical_count"])
+        kpi_cols[2].metric("Highest missing", findings["highest_missing_value_column"])
+        kpi_cols[3].metric("Most variable", findings["most_variable_numeric_column"])
+        kpi_cols[4].metric("Most imbalanced", findings["most_imbalanced_categorical_column"])
+
+        st.markdown("### Key Takeaways")
+        for takeaway in descriptive_takeaways(num_stats, cat_stats):
+            st.write(f"- {takeaway}")
+
+        numeric_summary_tab, categorical_summary_tab = st.tabs(["Numeric Summary", "Categorical Summary"])
+        with numeric_summary_tab:
+            if num_stats.empty:
+                st.info("No numeric columns detected.")
+            else:
+                st.dataframe(compact_numeric_summary(num_stats), use_container_width=True, hide_index=True)
+                st.download_button("Download numeric summary CSV", num_stats.to_csv().encode("utf-8"), "numeric_summary.csv", "text/csv")
+
+                with st.expander("Advanced numeric statistics", expanded=False):
+                    advanced_cols = ["variance", "range", "IQR", "skewness", "kurtosis", "outlier_count_iqr", "coefficient_of_variation"]
+                    advanced = num_stats[[c for c in advanced_cols if c in num_stats.columns]].reset_index().round(3)
+                    st.dataframe(advanced, use_container_width=True, hide_index=True)
+
+                st.markdown("#### Numeric visualization")
+                chart_col, variable_col = st.columns([1, 2])
+                with chart_col:
+                    numeric_chart_type = st.radio("Numeric chart", ["Histogram", "Boxplot"], horizontal=True)
+                with variable_col:
+                    default_numeric = num_stats["std"].fillna(0).idxmax() if "std" in num_stats else numeric_cols[0]
+                    selected_numeric = st.selectbox("Numeric variable", numeric_cols, index=numeric_cols.index(default_numeric) if default_numeric in numeric_cols else 0)
+                if numeric_chart_type == "Histogram":
+                    st.plotly_chart(px.histogram(df, x=selected_numeric, marginal="box", title=f"Distribution of {selected_numeric}"), use_container_width=True, key=f"desc_numeric_hist_{chart_key_part(selected_numeric)}")
+                else:
+                    st.plotly_chart(px.box(df, y=selected_numeric, points="outliers", title=f"Boxplot of {selected_numeric}"), use_container_width=True, key=f"desc_numeric_box_{chart_key_part(selected_numeric)}")
+
+        with categorical_summary_tab:
+            if cat_stats.empty:
+                st.info("No categorical columns detected.")
+            else:
+                st.dataframe(compact_categorical_summary(cat_stats), use_container_width=True, hide_index=True)
+                st.download_button("Download categorical summary CSV", cat_stats.to_csv().encode("utf-8"), "categorical_summary.csv", "text/csv")
+
+                st.markdown("#### Categorical visualization")
+                default_cat = cat_stats["top_value_percent"].fillna(0).idxmax() if "top_value_percent" in cat_stats else categorical_cols[0]
+                selected_cat_chart = st.selectbox("Categorical variable", categorical_cols, index=categorical_cols.index(default_cat) if default_cat in categorical_cols else 0, key="desc_cat_chart_col")
+                cat_counts = frequency_table(df, selected_cat_chart).head(10).reset_index().rename(columns={"index": selected_cat_chart})
+                st.plotly_chart(px.bar(cat_counts, x=selected_cat_chart, y="count", title=f"Top categories in {selected_cat_chart}"), use_container_width=True, key=f"desc_cat_count_{chart_key_part(selected_cat_chart)}")
+
+                with st.expander("Detailed frequency tables", expanded=False):
+                    selected_freq_col = st.selectbox("Frequency table column", categorical_cols, index=categorical_cols.index(default_cat) if default_cat in categorical_cols else 0, key="desc_frequency_col")
+                    freq = frequency_table(df, selected_freq_col).head(10)
+                    st.dataframe(freq, use_container_width=True)
+                    st.caption("Showing the top 10 categories by default. Download the full table for complete detail.")
+                    full_freq = frequency_table(df, selected_freq_col)
+                    st.download_button(f"Download {selected_freq_col} frequency CSV", full_freq.to_csv().encode("utf-8"), f"{selected_freq_col}_frequency.csv", "text/csv")
     else:
         st.info("Descriptive Statistics is hidden by the sidebar section selector.")
 
@@ -2762,36 +2854,77 @@ with ml_tab:
 with visualization_tab:
     if "Visualizations" in selected_sections:
         st.subheader("Expert Visualization Studio")
-        st.markdown("### Chart recommendation engine")
-        st.dataframe(pd.DataFrame(recommend_visualizations(df)), use_container_width=True, hide_index=True)
-        st.markdown("### Automatic best charts")
-        for index, (title, auto_fig, caption) in enumerate(recommended_story_charts(df)):
-            st.plotly_chart(auto_fig, use_container_width=True, key=f"visualization_auto_chart_{index}_{chart_key_part(title)}")
-            st.markdown(f"**Caption:** {caption}")
-            st.markdown(chart_explanation(title))
-        chart_type = st.selectbox("Chart type", ["Histogram", "KDE/density plot", "Boxplot", "Violin plot", "Scatter plot", "Regression scatter plot", "Correlation heatmap", "Bar chart", "Count plot", "Grouped bar chart", "Line plot", "Pie chart", "Stacked bar chart", "Area chart", "Pair plot style scatter matrix", "3D scatter plot", "Missing-value heatmap", "Outlier plot", "Distribution comparison"])
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
+        st.caption("Build one focused interactive chart at a time, then review interpretation and export options below.")
+
+        studio_left, studio_right = st.columns([0.36, 0.64], gap="large")
+        filtered_df = df.copy()
+        with studio_left:
+            st.markdown("### Controls")
+            chart_type = st.selectbox("Chart type", ["Histogram", "KDE/density plot", "Boxplot", "Violin plot", "Scatter plot", "Regression scatter plot", "Correlation heatmap", "Bar chart", "Count plot", "Grouped bar chart", "Line plot", "Pie chart", "Stacked bar chart", "Area chart", "Pair plot style scatter matrix", "3D scatter plot", "Missing-value heatmap", "Outlier plot", "Distribution comparison"])
             x_col = st.selectbox("X-axis", all_cols_with_none, index=1 if len(all_cols_with_none) > 1 else 0)
-        with c2:
             y_options = ["None"] + numeric_cols
             y_col = st.selectbox("Y-axis", y_options, index=1 if len(y_options) > 1 else 0)
-        with c3:
-            color_col = st.selectbox("Color/group", all_cols_with_none)
-        with c4:
+            color_col = st.selectbox("Color/group column", all_cols_with_none)
             agg = st.selectbox("Aggregation", ["Mean", "Median", "Sum", "Count"], index=0)
-        fig = render_visualization(df, chart_type, None if x_col == "None" else x_col, None if y_col == "None" else y_col, color_col, agg)
-        if fig is None:
-            st.warning("This chart needs different variable selections or more numeric columns.")
-        else:
-            st.plotly_chart(fig, use_container_width=True, key=f"visualization_custom_{chart_key_part(chart_type)}_{chart_key_part(x_col)}_{chart_key_part(y_col)}_{chart_key_part(color_col)}_{chart_key_part(agg)}")
-            st.markdown(chart_explanation(chart_type, None if x_col == "None" else x_col, None if y_col == "None" else y_col))
-            html_chart = fig.to_html(include_plotlyjs="cdn")
-            st.download_button("Export chart as HTML", html_chart.encode("utf-8"), f"{chart_type.lower().replace(' ', '_')}.html", "text/html")
-            chart_record = {"chart_type": chart_type, "x": None if x_col == "None" else x_col, "y": None if y_col == "None" else y_col, "color": None if color_col == "None" else color_col, "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
-            if chart_record not in st.session_state.chart_history:
-                st.session_state.chart_history.append(chart_record)
-                st.session_state.chart_history = st.session_state.chart_history[-12:]
+            with st.expander("Optional filters", expanded=False):
+                filter_col = st.selectbox("Filter column", all_cols_with_none, key="viz_filter_col")
+                if filter_col != "None":
+                    if pd.api.types.is_numeric_dtype(df[filter_col]):
+                        values = pd.to_numeric(df[filter_col], errors="coerce").dropna()
+                        if values.empty:
+                            st.info("Selected filter column has no numeric values to filter.")
+                        else:
+                            lo, hi = float(values.min()), float(values.max())
+                            selected_range = st.slider("Value range", lo, hi, (lo, hi), key="viz_filter_range")
+                            filtered_df = filtered_df[pd.to_numeric(filtered_df[filter_col], errors="coerce").between(selected_range[0], selected_range[1])]
+                    else:
+                        choices = df[filter_col].astype("object").fillna("<Missing>").value_counts().head(30).index.astype(str).tolist()
+                        selected_values = st.multiselect("Values", choices, default=choices[: min(10, len(choices))], key="viz_filter_values")
+                        if selected_values:
+                            filtered_df = filtered_df[filtered_df[filter_col].astype("object").fillna("<Missing>").astype(str).isin(selected_values)]
+            generate_chart = st.button("Generate chart", type="primary", use_container_width=True)
+            if "viz_generate_clicked" not in st.session_state:
+                st.session_state.viz_generate_clicked = False
+            if generate_chart:
+                st.session_state.viz_generate_clicked = True
+
+        fig = render_visualization(filtered_df, chart_type, None if x_col == "None" else x_col, None if y_col == "None" else y_col, color_col, agg)
+        with studio_right:
+            st.markdown("### Chart")
+            if fig is None:
+                st.warning("This chart needs different variable selections or more numeric columns.")
+            else:
+                fig.update_layout(autosize=True, margin=dict(l=30, r=30, t=60, b=35))
+                st.plotly_chart(fig, use_container_width=True, key=f"visualization_custom_{chart_key_part(chart_type)}_{chart_key_part(x_col)}_{chart_key_part(y_col)}_{chart_key_part(color_col)}_{chart_key_part(agg)}")
+                st.caption(short_chart_description(chart_type))
+                chart_record = {"chart_type": chart_type, "x": None if x_col == "None" else x_col, "y": None if y_col == "None" else y_col, "color": None if color_col == "None" else color_col, "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
+                if chart_record not in st.session_state.chart_history:
+                    st.session_state.chart_history.append(chart_record)
+                    st.session_state.chart_history = st.session_state.chart_history[-12:]
+
+        st.divider()
+        st.markdown("### Interpretation and next steps")
+        info_left, info_right = st.columns(2, gap="large")
+        with info_left:
+            with st.expander("Expert interpretation", expanded=True):
+                st.markdown(chart_explanation(chart_type, None if x_col == "None" else x_col, None if y_col == "None" else y_col))
+            with st.expander("Chart insights and warnings", expanded=False):
+                st.write(f"- Chart is based on **{len(filtered_df):,}** of **{len(df):,}** rows after optional filters.")
+                if filtered_df.empty:
+                    st.warning("The current filters remove all rows.")
+                if chart_type in {"Scatter plot", "Regression scatter plot"} and (x_col == "None" or y_col == "None"):
+                    st.warning("Scatter charts need both X and Y numeric selections.")
+                if color_col != "None" and filtered_df[color_col].nunique(dropna=True) > 20:
+                    st.warning("The color/group column has many categories; consider filtering or choosing a lower-cardinality group.")
+        with info_right:
+            with st.expander("Recommendations and related analysis", expanded=True):
+                recs = recommend_visualizations(df)
+                st.dataframe(pd.DataFrame(recs).head(6), use_container_width=True, hide_index=True)
+            with st.expander("Export and advanced options", expanded=False):
+                if fig is not None:
+                    html_chart = fig.to_html(include_plotlyjs="cdn")
+                    st.download_button("Export chart as HTML", html_chart.encode("utf-8"), f"{chart_type.lower().replace(' ', '_')}.html", "text/html")
+                st.write("Use the optional filters to focus the chart before exporting or running statistical tests.")
     else:
         st.info("Visualizations is hidden by the sidebar section selector.")
 
@@ -2819,6 +2952,24 @@ with ask_tab:
             st.session_state.pending_analysis_request = None
             st.session_state.chat_dataset_signature = dataset_signature
             st.session_state.analysis_memory = [{"type": "automatic_dataset_intelligence", "summary": auto_summary[:1500]}]
+
+        st.markdown("### Ask a question")
+        with st.form("ask_your_data_top_form", clear_on_submit=True):
+            top_prompt = st.text_input("What would you like to analyze?", placeholder="Ask for a chart, test, model, quality check, or recommendation…")
+            submitted_prompt = st.form_submit_button("Send", type="primary")
+        if submitted_prompt and top_prompt.strip():
+            st.session_state.pending_chat_prompt = top_prompt.strip()
+            st.rerun()
+
+        st.markdown("**Suggested prompts:**")
+        smart_actions = suggest_smart_actions(df)
+        for row_index in range(0, len(smart_actions), 4):
+            row_actions = smart_actions[row_index : row_index + 4]
+            cols = st.columns(len(row_actions))
+            for col, suggestion in zip(cols, row_actions):
+                if col.button(suggestion, key=f"ask_action_{row_index}_{suggestion}"):
+                    st.session_state.pending_chat_prompt = suggestion
+                    st.rerun()
 
         intelligence = build_dataset_intelligence(df)
         panel1, panel2, panel3 = st.columns(3)
@@ -2860,16 +3011,6 @@ with ask_tab:
                 "categorical frequencies, correlations, IQR outlier counts, and previous Ask Your Data results. "
                 "If OpenAI is configured, it may refine intent and narrative from metadata only; all calculations still run locally."
             )
-
-        st.markdown("**Smart analysis buttons:**")
-        smart_actions = suggest_smart_actions(df)
-        for row_index in range(0, len(smart_actions), 4):
-            row_actions = smart_actions[row_index : row_index + 4]
-            cols = st.columns(len(row_actions))
-            for col, suggestion in zip(cols, row_actions):
-                if col.button(suggestion, key=f"ask_action_{row_index}_{suggestion}"):
-                    st.session_state.pending_chat_prompt = suggestion
-                    st.rerun()
 
         chat_container = st.container(height=620, border=True)
         with chat_container:
@@ -2930,7 +3071,7 @@ with ask_tab:
                 st.session_state.pending_analysis_request = None
                 st.rerun()
 
-        prompt = st.session_state.pending_chat_prompt or st.chat_input("Ask for a chart, test, model, quality check, or recommendation…")
+        prompt = st.session_state.pending_chat_prompt
         st.session_state.pending_chat_prompt = None
 
         if prompt:
@@ -2993,8 +3134,12 @@ with business_report_tab:
         if summary_tables:
             csv_summary = pd.concat(summary_tables, ignore_index=True, sort=False).to_csv(index=False)
             st.download_button("Download CSV summary tables", csv_summary.encode("utf-8"), f"summary_tables_{timestamp}.csv", "text/csv")
-        with st.expander("Preview Markdown report", expanded=True):
-            st.markdown(report)
+        st.markdown("### Report Preview")
+        executive_report = report.split("## Technical Appendix:")[0].strip()
+        st.markdown(executive_report)
+        with st.expander("Technical appendices", expanded=False):
+            technical_report = "## Technical Appendix:" + report.split("## Technical Appendix:", 1)[1] if "## Technical Appendix:" in report else "No technical appendix available."
+            st.markdown(technical_report)
         with st.expander("Preview HTML source"):
             st.code(html_report[:8000], language="html")
     else:
