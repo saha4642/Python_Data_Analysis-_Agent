@@ -1078,6 +1078,57 @@ def safe_pct(numerator: float, denominator: float) -> float:
     return float(numerator / denominator * 100) if denominator else 0.0
 
 
+def _compact_label(value: object, max_chars: int = 42) -> str:
+    """Keep top-level dashboard labels readable without changing underlying analytics."""
+    text = str(value) if value not in (None, "") else "—"
+    return text if len(text) <= max_chars else text[: max_chars - 1].rstrip() + "…"
+
+
+def render_descriptive_kpi_card(label: str, value: object, helper: str = "") -> None:
+    """Render a compact, evenly aligned KPI card for the descriptive statistics header."""
+    safe_label = html.escape(str(label))
+    safe_value = html.escape(_compact_label(value))
+    safe_helper = html.escape(helper)
+    st.markdown(
+        f"""
+        <div style="
+            border: 1px solid rgba(49, 51, 63, 0.14);
+            border-radius: 14px;
+            padding: 0.85rem 0.95rem;
+            min-height: 7.15rem;
+            background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(248,250,252,0.92));
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        ">
+            <div style="
+                color: rgba(49, 51, 63, 0.68);
+                font-size: 0.76rem;
+                font-weight: 700;
+                letter-spacing: 0.04em;
+                text-transform: uppercase;
+                line-height: 1.2;
+            ">{safe_label}</div>
+            <div style="
+                color: rgb(17, 24, 39);
+                font-size: 1.2rem;
+                font-weight: 750;
+                line-height: 1.24;
+                margin: 0.45rem 0 0.35rem 0;
+                overflow-wrap: anywhere;
+            ">{safe_value}</div>
+            <div style="
+                color: rgba(49, 51, 63, 0.58);
+                font-size: 0.78rem;
+                line-height: 1.25;
+            ">{safe_helper}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def summarize_key_findings(df: pd.DataFrame) -> dict[str, str]:
     types = infer_column_types(df)
     relationships = compute_relationship_findings(df)
@@ -2505,12 +2556,25 @@ with descriptive_tab:
         cat_stats = categorical_summary(df)
         findings = summarize_key_findings(df)
 
-        kpi_cols = st.columns(5)
-        kpi_cols[0].metric("Numeric columns", findings["numeric_count"])
-        kpi_cols[1].metric("Categorical columns", findings["categorical_count"])
-        kpi_cols[2].metric("Highest missing", findings["highest_missing_value_column"])
-        kpi_cols[3].metric("Most variable", findings["most_variable_numeric_column"])
-        kpi_cols[4].metric("Most imbalanced", findings["most_imbalanced_categorical_column"])
+        overview_col, signal_col = st.columns([1.05, 1.6], gap="large")
+        with overview_col:
+            st.markdown("#### Dataset profile")
+            count_cols = st.columns(2, gap="small")
+            with count_cols[0]:
+                render_descriptive_kpi_card("Numeric", findings["numeric_count"], "measures")
+            with count_cols[1]:
+                render_descriptive_kpi_card("Categorical", findings["categorical_count"], "segments")
+        with signal_col:
+            st.markdown("#### Quick signals")
+            signal_cols = st.columns(3, gap="small")
+            signal_cards = [
+                ("Missing", findings["highest_missing_value_column"], "largest gap"),
+                ("Variability", findings["most_variable_numeric_column"], "highest spread"),
+                ("Imbalance", findings["most_imbalanced_categorical_column"], "dominant category"),
+            ]
+            for col, (label, value, helper) in zip(signal_cols, signal_cards):
+                with col:
+                    render_descriptive_kpi_card(label, value, helper)
 
         st.markdown("### Key Takeaways")
         for takeaway in descriptive_takeaways(num_stats, cat_stats):
@@ -2940,14 +3004,7 @@ with ask_tab:
         dataset_signature = (tuple(df.columns.astype(str).tolist()), int(df.shape[0]), int(df.shape[1]))
         if st.session_state.chat_dataset_signature != dataset_signature:
             auto_summary = generate_expert_intelligence_markdown(df)
-            st.session_state.chat_history = [
-                {
-                    "id": "msg_auto_dataset_intelligence",
-                    "role": "assistant",
-                    "content": auto_summary,
-                    "analysis_result": None,
-                }
-            ]
+            st.session_state.chat_history = []
             st.session_state.pending_chat_prompt = None
             st.session_state.pending_analysis_request = None
             st.session_state.chat_dataset_signature = dataset_signature
@@ -3021,6 +3078,8 @@ with ask_tab:
                         "or **Build a regression model to predict G3 using G1, G2, studytime, failures, absences**."
                     )
             for message in st.session_state.chat_history:
+                if message.get("id") == "msg_auto_dataset_intelligence":
+                    continue
                 with st.chat_message(message["role"]):
                     st.markdown(message["content"])
                     if message.get("analysis_result"):
@@ -3063,7 +3122,7 @@ with ask_tab:
             if run_now:
                 question = pending["question"]
                 result = run_requested_analysis(detected, df, selected, question)
-                assistant_content = f"Detected intent: **{detected.intent}** (confidence {detected.confidence:.0%}). I ran the requested analysis locally."
+                assistant_content = "Here’s the answer from the local analysis."
                 message_id = f"msg_{len(st.session_state.chat_history)}"
                 st.session_state.chat_history.append({"id": message_id, "role": "assistant", "content": assistant_content, "analysis_result": result, "show_code": detected.needs_code})
                 store_analysis_memory(question, detected, result)
@@ -3083,7 +3142,7 @@ with ask_tab:
                 st.session_state.pending_analysis_request = {"question": prompt, "detected": detected, "missing": missing}
             else:
                 result = run_requested_analysis(detected, df, {}, prompt)
-                assistant_content = f"Detected intent: **{detected.intent}** (confidence {detected.confidence:.0%}). I ran the requested analysis locally."
+                assistant_content = "Here’s the answer from the local analysis."
                 if not result.valid:
                     assistant_content = "I could not confidently run that request yet. Here is a safe clarification and examples based on your columns."
                 message_id = f"msg_{len(st.session_state.chat_history)}"
