@@ -3028,47 +3028,30 @@ with ask_tab:
                     st.session_state.pending_chat_prompt = suggestion
                     st.rerun()
 
-        intelligence = build_dataset_intelligence(df)
-        panel1, panel2, panel3 = st.columns(3)
-        with panel1:
-            st.info(
-                "**Expert Recommendations**\n\n"
-                + "\n".join(f"- {step}" for step in intelligence["next_steps"][:3])
-            )
-        with panel2:
-            risk_items: list[str] = []
-            if intelligence["high_missing"]:
-                risk_items.append(f"High missingness in {intelligence['high_missing'][0]['column']} ({intelligence['high_missing'][0]['percent']:.1f}%).")
-            if intelligence["outlier_heavy_columns"]:
-                risk_items.append(f"Outliers in {intelligence['outlier_heavy_columns'][0]['column']} ({intelligence['outlier_heavy_columns'][0]['percent']:.1f}% flagged).")
-            if intelligence["imbalance_warnings"]:
-                risk_items.append(f"Imbalance in {intelligence['imbalance_warnings'][0]['column']} ({intelligence['imbalance_warnings'][0]['top_percent']:.1f}% top class).")
-            if intelligence["multicollinearity"]:
-                risk_items.append(f"Multicollinearity: {intelligence['multicollinearity'][0]['left']} vs {intelligence['multicollinearity'][0]['right']}.")
-            st.warning("**Potential Risks**\n\n" + "\n".join(f"- {item}" for item in (risk_items or ["No major automated risk flags; still validate with visuals."])))
-        with panel3:
-            st.success(
-                "**What I can execute**\n\n"
-                "- Plotly visualizations\n"
-                "- Correlation, chi-square, t-test, ANOVA, Mann-Whitney, Kruskal-Wallis\n"
-                "- Regression/classification models and feature importance"
-            )
+        if "pending_analysis_request" not in st.session_state:
+            st.session_state.pending_analysis_request = None
 
-        with st.expander("Automatic Dataset Intelligence Summary", expanded=True):
-            st.markdown(generate_expert_intelligence_markdown(df))
+        prompt = st.session_state.pending_chat_prompt
+        st.session_state.pending_chat_prompt = None
 
-        with st.expander("What the assistant can use", expanded=False):
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Rows", f"{df.shape[0]:,}")
-            c2.metric("Columns", f"{df.shape[1]:,}")
-            c3.metric("Quality score", f"{intelligence['quality_score']}/100")
-            c4.metric("Missing cells", f"{int(df.isna().sum().sum()):,}")
-            st.write(
-                "The execution engine uses dataframe shape, schema, data types, missing-value reports, descriptive stats, "
-                "categorical frequencies, correlations, IQR outlier counts, and previous Ask Your Data results. "
-                "If OpenAI is configured, it may refine intent and narrative from metadata only; all calculations still run locally."
-            )
+        if prompt:
+            detected = detect_analysis_intent(prompt, df, dataframe_metadata(df))
+            user_message = {"id": f"msg_{len(st.session_state.chat_history)}", "role": "user", "content": prompt, "analysis_result": None}
+            st.session_state.chat_history.append(user_message)
+            missing = needs_column_selection(detected, df)
+            if missing:
+                st.session_state.pending_analysis_request = {"question": prompt, "detected": detected, "missing": missing}
+            else:
+                result = run_requested_analysis(detected, df, {}, prompt)
+                assistant_content = "Here’s the answer from the local analysis."
+                if not result.valid:
+                    assistant_content = "I could not confidently run that request yet. Here is a safe clarification and examples based on your columns."
+                message_id = f"msg_{len(st.session_state.chat_history)}"
+                st.session_state.chat_history.append({"id": message_id, "role": "assistant", "content": assistant_content, "analysis_result": result, "show_code": detected.needs_code})
+                store_analysis_memory(prompt, detected, result)
+                record_session_result(f"Ask Your Data — {prompt}: {result.result_summary}")
 
+        st.markdown("### Conversation")
         chat_container = st.container(height=620, border=True)
         with chat_container:
             if not st.session_state.chat_history:
@@ -3084,9 +3067,6 @@ with ask_tab:
                     st.markdown(message["content"])
                     if message.get("analysis_result"):
                         display_analysis_result(message["analysis_result"], message_id=message["id"], show_code=message.get("show_code", False))
-
-        if "pending_analysis_request" not in st.session_state:
-            st.session_state.pending_analysis_request = None
 
         if st.session_state.pending_analysis_request:
             pending = st.session_state.pending_analysis_request
@@ -3130,26 +3110,50 @@ with ask_tab:
                 st.session_state.pending_analysis_request = None
                 st.rerun()
 
-        prompt = st.session_state.pending_chat_prompt
-        st.session_state.pending_chat_prompt = None
+        st.divider()
+        st.markdown("### Dataset intelligence reference")
+        st.caption("These automated guidance panels are kept below the interactive conversation so the Ask Your Data tab stays chat-first.")
 
-        if prompt:
-            detected = detect_analysis_intent(prompt, df, dataframe_metadata(df))
-            user_message = {"id": f"msg_{len(st.session_state.chat_history)}", "role": "user", "content": prompt, "analysis_result": None}
-            st.session_state.chat_history.append(user_message)
-            missing = needs_column_selection(detected, df)
-            if missing:
-                st.session_state.pending_analysis_request = {"question": prompt, "detected": detected, "missing": missing}
-            else:
-                result = run_requested_analysis(detected, df, {}, prompt)
-                assistant_content = "Here’s the answer from the local analysis."
-                if not result.valid:
-                    assistant_content = "I could not confidently run that request yet. Here is a safe clarification and examples based on your columns."
-                message_id = f"msg_{len(st.session_state.chat_history)}"
-                st.session_state.chat_history.append({"id": message_id, "role": "assistant", "content": assistant_content, "analysis_result": result, "show_code": detected.needs_code})
-                store_analysis_memory(prompt, detected, result)
-                record_session_result(f"Ask Your Data — {prompt}: {result.result_summary}")
-            st.rerun()
+        intelligence = build_dataset_intelligence(df)
+        panel1, panel2, panel3 = st.columns(3)
+        with panel1:
+            st.info(
+                "**Expert Recommendations**\n\n"
+                + "\n".join(f"- {step}" for step in intelligence["next_steps"][:3])
+            )
+        with panel2:
+            risk_items: list[str] = []
+            if intelligence["high_missing"]:
+                risk_items.append(f"High missingness in {intelligence['high_missing'][0]['column']} ({intelligence['high_missing'][0]['percent']:.1f}%).")
+            if intelligence["outlier_heavy_columns"]:
+                risk_items.append(f"Outliers in {intelligence['outlier_heavy_columns'][0]['column']} ({intelligence['outlier_heavy_columns'][0]['percent']:.1f}% flagged).")
+            if intelligence["imbalance_warnings"]:
+                risk_items.append(f"Imbalance in {intelligence['imbalance_warnings'][0]['column']} ({intelligence['imbalance_warnings'][0]['top_percent']:.1f}% top class).")
+            if intelligence["multicollinearity"]:
+                risk_items.append(f"Multicollinearity: {intelligence['multicollinearity'][0]['left']} vs {intelligence['multicollinearity'][0]['right']}.")
+            st.warning("**Potential Risks**\n\n" + "\n".join(f"- {item}" for item in (risk_items or ["No major automated risk flags; still validate with visuals."])))
+        with panel3:
+            st.success(
+                "**What I can execute**\n\n"
+                "- Plotly visualizations\n"
+                "- Correlation, chi-square, t-test, ANOVA, Mann-Whitney, Kruskal-Wallis\n"
+                "- Regression/classification models and feature importance"
+            )
+
+        with st.expander("Automatic Dataset Intelligence Summary", expanded=False):
+            st.markdown(generate_expert_intelligence_markdown(df))
+
+        with st.expander("What the assistant can use", expanded=False):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Rows", f"{df.shape[0]:,}")
+            c2.metric("Columns", f"{df.shape[1]:,}")
+            c3.metric("Quality score", f"{intelligence['quality_score']}/100")
+            c4.metric("Missing cells", f"{int(df.isna().sum().sum()):,}")
+            st.write(
+                "The execution engine uses dataframe shape, schema, data types, missing-value reports, descriptive stats, "
+                "categorical frequencies, correlations, IQR outlier counts, and previous Ask Your Data results. "
+                "If OpenAI is configured, it may refine intent and narrative from metadata only; all calculations still run locally."
+            )
 
         with st.expander("Ask Your Data memory for this session"):
             st.json(st.session_state.analysis_memory[-10:])
